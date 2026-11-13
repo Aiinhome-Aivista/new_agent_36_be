@@ -1,7 +1,44 @@
 import re
 from typing import Dict, Any, Optional
 
+PROMPT_INJECTION_PATTERNS = [
+    # 1. Instruction overrides & memory wipes
+    r"\b(ignore|disregard|forget|override|bypass|clear|drop)\s+(all\s+)?(previous|prior|above|past|initial|system)\s+(instructions|prompts|rules|commands|constraints|guidelines|directives)\b",
+    r"\b(ignore|disregard|forget)\s+everything\s+(above|previously\s+said|before)\b",
+    r"\bfrom\s+now\s+on\b.*?\b(ignore|disregard|forget|you\s+are\s+no\s+longer|you\s+must\s+obey)\b",
+    
+    # 2. Jailbreak personas & modes (DAN, Developer Mode, Unrestricted, AIM)
+    r"\b(you\s+are\s+now|act\s+as|roleplay\s+as|pretend\s+to\s+be)\s+(an?\s+)?(dan|unrestricted|jailbreak|jailbroken|evil|unfiltered|uncensored|developer\s+mode|god\s+mode|root)\b",
+    r"\b(dan\s+mode|developer\s+mode\s+enabled|jailbreak\s+prompt|do\s+anything\s+now)\b",
+    r"\bpretend\s+(you\s+have\s+no\s+rules|there\s+are\s+no\s+restrictions|safety\s+filters\s+are\s+off)\b",
+    r"\b(bypass|disable|turn\s+off)\s+(all\s+)?(safety|guardrails?|security|filters?|content\s+filters?|rules)\b",
+    
+    # 3. System prompt & instruction extraction / leakage
+    r"\b(repeat|print|reveal|output|display|show|leak|echo|dump)\s+(your\s+|the\s+)?(system\s+prompt|initial\s+prompt|system\s+instructions?|internal\s+instructions?|base\s+prompt|secret\s+instructions?|hidden\s+prompt)\b",
+    r"\b(what\s+is\s+your\s+system\s+prompt|what\s+are\s+your\s+instructions\s+above|repeat\s+everything\s+above)\b",
+    r"\boutput\s+the\s+initial\s+text\s+verbatim\b",
+    
+    # 4. Role spoofing & delimiter injection
+    r"(^|\n)\s*(system:\s*|human:\s*|assistant:\s*|###\s*instruction|\[system\s*instruction\]|<\|im_start\|>|<system>|\[INST\])",
+    r"\b(sudo\s+mode|admin\s+override|system\s+override|root\s+access\s+granted)\b"
+]
+
 INTENT_PATTERNS = {
+    "out_of_scope": [
+        # Political / world leaders / government / elections
+        r"\b(prime\s+minister|chancellor|monarch|cabinet\s+minister|politician)\b",
+        r"\bpresident\s+of\b",
+        r"\bwho\s+is\s+(the\s+)?(current\s+)?(prime\s+minister|president|king|queen|governor|mayor|chancellor|leader\s+of)\b",
+        r"\b(who\s+won\s+the\s+election|election\s+results?|politics\s+in|government\s+of)\b",
+        # Geography / weather / general world trivia
+        r"\b(capital\s+of|weather\s+in|forecast\s+in|population\s+of|currency\s+of|temperature\s+in)\b",
+        # Sports / entertainment / celebrities / cooking recipes
+        r"\b(world\s+cup|cricket\s+(score|match|team)|football\s+(score|match|team)|super\s+bowl|olympics\s+medal)\b",
+        r"\b(recipe\s+for|how\s+to\s+cook|how\s+to\s+bake|ingredients\s+for)\b",
+        r"\b(celebrity\s+gossip|box\s+office\s+collection|movie\s+review|movie\s+plot|song\s+lyrics)\b",
+        # Broad non-technical inquiries
+        r"\b(general\s+knowledge|world\s+history|world\s+war)\b"
+    ],
     "code_conversion": [
         r"\bconvert\b.*?\bto\b", r"\bport\b.*?\bto\b", r"\brewrite\b.*?\bin\b",
         r"\btranslate\b.*?\bto\b", r"\bhow\s+to\s+write\s+this\s+in\b"
@@ -49,13 +86,26 @@ KNOWN_LANGUAGES = [
 
 class QueryRouter:
     @classmethod
-    def route_query(cls, query: str, user_selected_language: Optional[str] = None) -> Dict[str, Any]:
+    def route_query(cls, query: str, user_selected_language: Optional[str] = None, attached_code: Optional[str] = None) -> Dict[str, Any]:
         """
-        Classifies user query intent, extracts referenced languages,
-        and provides routing directives for the RAG pipeline.
+        Classifies user query intent, inspects for adversarial prompt injection,
+        extracts referenced languages, and provides routing directives for the RAG pipeline.
         """
         clean_query = query.strip()
         lower_query = clean_query.lower()
+        combined_text = lower_query + ("\n" + attached_code.lower() if attached_code else "")
+
+        # 0. Prompt Injection & Security Guardrail
+        for pattern in PROMPT_INJECTION_PATTERNS:
+            if re.search(pattern, combined_text):
+                return {
+                    "intent": "prompt_injection",
+                    "filter_language": None,
+                    "target_language": None,
+                    "extracted_languages": [],
+                    "requires_mysql_body": False,
+                    "security_flag": True
+                }
 
         # 1. Detect Intent
         detected_intent = "general_question"
