@@ -34,6 +34,11 @@ INTENT_PATTERNS = {
     "function_lookup": [
         r"\bfind\b", r"\bsearch\b", r"\bshow\s+me\b", r"\bget\b",
         r"\bis\s+there\s+a\s+function\b", r"\bwhere\s+is\b", r"\blist\b"
+    ],
+    "greeting": [
+        r"^(hi|hello|hey|greetings|howdy|good\s+(morning|afternoon|evening))\b",
+        r"\b(who\s+are\s+you|what\s+can\s+you\s+do|what\s+is\s+devknow)\b",
+        r"^(thanks|thank\s+you)\b"
     ]
 }
 

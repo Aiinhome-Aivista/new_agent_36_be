@@ -10,6 +10,7 @@ from app.services.gemini_service import gemini_service
 from app.services.query_router import QueryRouter
 from app.models.database_models import FunctionRecord, Conversation, ConversationMessage
 from app.rag.prompts import (
+    GREETING_PROMPT_TEMPLATE,
     KB_HIT_PROMPT_TEMPLATE,
     KB_MISS_PROMPT_TEMPLATE,
     CODE_IMPROVEMENT_PROMPT_TEMPLATE,
@@ -144,13 +145,36 @@ class RetrievalService:
                 )
         else:
             source = "llm_fallback"
-            prompt = KB_MISS_PROMPT_TEMPLATE.format(
-                query=query,
-                attached_code_section=attached_code_section,
-                history=history
-            )
+            if intent == "greeting":
+                prompt = GREETING_PROMPT_TEMPLATE.format(query=query)
+            else:
+                prompt = KB_MISS_PROMPT_TEMPLATE.format(
+                    query=query,
+                    attached_code_section=attached_code_section,
+                    history=history
+                )
 
         latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        # Step 6: Assemble Thinking Process for UI Reasoning Disclosure
+        thinking_steps = [
+            {
+                "title": "Intent & Language Routing",
+                "detail": f"Classified intent as '{intent.replace('_', ' ')}'. Language filter: '{filter_lang or 'all'}'."
+            },
+            {
+                "title": "Runbook Semantic Search",
+                "detail": f"Searched organizational runbooks — found {len(vector_matches)} candidate(s) (highest match: {round(max_score * 100, 1)}%)." if vector_matches else "Searched organizational runbooks. No semantic matches found."
+            },
+            {
+                "title": "Knowledge Grounding Check",
+                "detail": f"Retrieved {len(retrieved_functions)} verified function(s) verbatim from database." if is_kb_hit else f"No company function exceeded similarity threshold ({Config.SIMILARITY_THRESHOLD}). Activating general developer intelligence."
+            },
+            {
+                "title": "Response Synthesis",
+                "detail": "Grounding response in verified organizational code and runbook logic." if is_kb_hit else ("Synthesizing polite conversational greeting." if intent == "greeting" else "Synthesizing solution using idiomatic programming practices.")
+            }
+        ]
 
         # Observability structured log
         obs_log = {
@@ -172,6 +196,7 @@ class RetrievalService:
             "max_score": max_score,
             "retrieved_functions": retrieved_functions,
             "prompt": prompt,
+            "thinking_steps": thinking_steps,
             "execution_metadata": obs_log
         }
 

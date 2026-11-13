@@ -15,6 +15,16 @@ CRITICAL OPERATIONAL RULES & GUARDRAILS:
 6. SECURITY & RELIABILITY: Always point out potential edge cases, security implications, or breaking changes when suggesting code modifications.
 """
 
+GREETING_PROMPT_TEMPLATE = """You are DevKnow, an expert AI Multi-Language Developer Knowledge Assistant.
+User Query / Greeting: {query}
+
+### INSTRUCTIONS:
+1. Provide a warm, concise, and professional developer greeting.
+2. Introduce yourself briefly as DevKnow, the organizational code intelligence assistant.
+3. Mention that you can help search internal company runbooks, explain complex functions, review code, optimize performance, and convert logic across programming languages.
+4. Keep the response natural, inviting, and clean. DO NOT output disclaimers or boilerplate reminders.
+"""
+
 KB_HIT_PROMPT_TEMPLATE = """### CONTEXT: RETRIEVED ORGANIZATIONAL FUNCTIONS FROM KNOWLEDGE BASE
 The following function(s) were retrieved from the organizational database:
 

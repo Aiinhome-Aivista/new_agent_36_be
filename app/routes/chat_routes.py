@@ -72,14 +72,16 @@ def chat():
     retrieved_functions = rag_result["retrieved_functions"]
 
     def generate_stream():
-        # 1. Emit metadata event
+        # 1. Emit metadata event with thinking / reasoning steps
         meta_payload = {
             "session_id": session_id,
             "source": source,
             "intent": intent,
             "similarity_score": max_score,
             "retrieved_count": len(retrieved_functions),
-            "retrieved_functions": retrieved_functions
+            "retrieved_functions": retrieved_functions,
+            "thinking_steps": rag_result.get("thinking_steps", []),
+            "latency_ms": rag_result.get("execution_metadata", {}).get("latency_ms", 0)
         }
         yield f"event: metadata\ndata: {json.dumps(meta_payload)}\n\n"
 
