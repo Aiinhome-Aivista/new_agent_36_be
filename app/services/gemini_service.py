@@ -66,17 +66,29 @@ class LLMService:
         else:
             yield from self._stream_gemini(prompt)
 
+    def _get_graceful_fallback(self, prompt: str) -> str:
+        """
+        User-friendly response when LLM synthesis is temporarily unavailable.
+        If organizational functions were retrieved in the prompt, highlights them cleanly.
+        """
+        if "### Function #" in prompt or "retrieved organizational database" in prompt.lower():
+            return (
+                "I have retrieved the relevant organizational function(s) from the knowledge base above. "
+                "You can inspect their exact signatures, parameters, and implementations directly in the function cards."
+            )
+        return (
+            "I am currently unable to synthesize an AI response. "
+            "Please try submitting your question again shortly."
+        )
+
     # ── 1. Google Gemini Streaming ──────────────────────────────────────────
     def _stream_gemini(self, prompt: str) -> Generator[str, None, None]:
         if not self._gemini_model and Config.GEMINI_API_KEY:
             self._init_provider()
 
         if not self._gemini_model:
-            yield f"### ⚠️ Gemini API Notice\n\n"
-            yield f"To enable real-time Gemini AI streaming, please add your `GEMINI_API_KEY` to the `backend/.env` file.\n\n"
-            yield f"---\n\n"
-            yield f"#### Grounded Context Analyzed:\n"
-            yield f"The RAG pipeline successfully retrieved the matching functions from ChromaDB and MySQL above."
+            logger.error("[DevKnow LLM Error] Gemini client is not initialized. Please verify GEMINI_API_KEY in .env.")
+            yield self._get_graceful_fallback(prompt)
             return
 
         try:
@@ -85,13 +97,14 @@ class LLMService:
                 if chunk.text:
                     yield chunk.text
         except Exception as e:
-            logger.error(f"Error streaming from Gemini: {e}")
-            yield f"\n\n**[Gemini API Error: {str(e)}]**"
+            logger.exception(f"Error streaming from Gemini: {e}")
+            yield self._get_graceful_fallback(prompt)
 
     # ── 2. OpenAI (ChatGPT / GPT-4o) Streaming ──────────────────────────────
     def _stream_openai(self, prompt: str) -> Generator[str, None, None]:
         if not Config.OPENAI_API_KEY:
-            yield "### ⚠️ OpenAI Notice\nPlease set `OPENAI_API_KEY` in `backend/.env` to use the OpenAI provider."
+            logger.error("[DevKnow LLM Error] OPENAI_API_KEY is not configured in .env.")
+            yield self._get_graceful_fallback(prompt)
             return
 
         base_url = Config.OPENAI_BASE_URL.rstrip('/')
@@ -115,7 +128,8 @@ class LLMService:
         try:
             with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as resp:
                 if resp.status_code != 200:
-                    yield f"**[OpenAI API Error: HTTP {resp.status_code} - {resp.text}]**"
+                    logger.error(f"[DevKnow OpenAI API Error] HTTP {resp.status_code} - {resp.text}")
+                    yield self._get_graceful_fallback(prompt)
                     return
                 for line in resp.iter_lines():
                     if line:
@@ -132,13 +146,14 @@ class LLMService:
                             except Exception:
                                 pass
         except Exception as e:
-            logger.error(f"OpenAI streaming error: {e}")
-            yield f"\n\n**[OpenAI Error: {str(e)}]**"
+            logger.exception(f"OpenAI streaming error: {e}")
+            yield self._get_graceful_fallback(prompt)
 
     # ── 3. Anthropic Claude Streaming ────────────────────────────────────────
     def _stream_claude(self, prompt: str) -> Generator[str, None, None]:
         if not Config.ANTHROPIC_API_KEY:
-            yield "### ⚠️ Anthropic Claude Notice\nPlease set `ANTHROPIC_API_KEY` in `backend/.env` to use the Claude provider."
+            logger.error("[DevKnow LLM Error] ANTHROPIC_API_KEY is not configured in .env.")
+            yield self._get_graceful_fallback(prompt)
             return
 
         url = "https://api.anthropic.com/v1/messages"
@@ -159,7 +174,8 @@ class LLMService:
         try:
             with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as resp:
                 if resp.status_code != 200:
-                    yield f"**[Claude API Error: HTTP {resp.status_code} - {resp.text}]**"
+                    logger.error(f"[DevKnow Claude API Error] HTTP {resp.status_code} - {resp.text}")
+                    yield self._get_graceful_fallback(prompt)
                     return
                 for line in resp.iter_lines():
                     if line:
@@ -175,13 +191,14 @@ class LLMService:
                             except Exception:
                                 pass
         except Exception as e:
-            logger.error(f"Claude streaming error: {e}")
-            yield f"\n\n**[Claude Error: {str(e)}]**"
+            logger.exception(f"Claude streaming error: {e}")
+            yield self._get_graceful_fallback(prompt)
 
     # ── 4. Azure OpenAI Streaming ────────────────────────────────────────────
     def _stream_azure_openai(self, prompt: str) -> Generator[str, None, None]:
         if not Config.AZURE_OPENAI_API_KEY or not Config.AZURE_OPENAI_ENDPOINT:
-            yield "### ⚠️ Azure OpenAI Notice\nPlease set `AZURE_OPENAI_API_KEY` and `AZURE_OPENAI_ENDPOINT` in `backend/.env`."
+            logger.error("[DevKnow LLM Error] AZURE_OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT missing in .env.")
+            yield self._get_graceful_fallback(prompt)
             return
 
         endpoint = Config.AZURE_OPENAI_ENDPOINT.rstrip('/')
@@ -207,7 +224,8 @@ class LLMService:
         try:
             with requests.post(url, headers=headers, json=payload, stream=True, timeout=60) as resp:
                 if resp.status_code != 200:
-                    yield f"**[Azure OpenAI Error: HTTP {resp.status_code} - {resp.text}]**"
+                    logger.error(f"[DevKnow Azure OpenAI Error] HTTP {resp.status_code} - {resp.text}")
+                    yield self._get_graceful_fallback(prompt)
                     return
                 for line in resp.iter_lines():
                     if line:
@@ -224,8 +242,8 @@ class LLMService:
                             except Exception:
                                 pass
         except Exception as e:
-            logger.error(f"Azure OpenAI error: {e}")
-            yield f"\n\n**[Azure OpenAI Error: {str(e)}]**"
+            logger.exception(f"Azure OpenAI error: {e}")
+            yield self._get_graceful_fallback(prompt)
 
     # ── 5. Local / Custom LLM (Ollama, vLLM, Mistral) Streaming ───────────────
     def _stream_custom_llm(self, prompt: str) -> Generator[str, None, None]:
@@ -243,7 +261,8 @@ class LLMService:
         try:
             with requests.post(url, json=payload, stream=True, timeout=Config.LLM_TIMEOUT) as resp:
                 if resp.status_code != 200:
-                    yield f"**[Custom LLM Error: HTTP {resp.status_code} - {resp.text}]**"
+                    logger.error(f"[DevKnow Custom LLM Error] HTTP {resp.status_code} - {resp.text}")
+                    yield self._get_graceful_fallback(prompt)
                     return
                 for line in resp.iter_lines():
                     if line:
@@ -258,8 +277,8 @@ class LLMService:
                         except Exception:
                             pass
         except Exception as e:
-            logger.error(f"Custom LLM error: {e}")
-            yield f"\n\n**[Custom LLM Error: {str(e)} - Is Ollama/vLLM running on {url}?]**"
+            logger.exception(f"Custom LLM error on {url}: {e}")
+            yield self._get_graceful_fallback(prompt)
 
     def generate_single(self, prompt: str) -> str:
         """Non-streaming single-shot completion"""

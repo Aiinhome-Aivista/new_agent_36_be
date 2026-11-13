@@ -93,8 +93,9 @@ def chat():
                 token_data = json.dumps({"token": token})
                 yield f"event: token\ndata: {token_data}\n\n"
         except Exception as e:
-            logger.error(f"Error during stream generation: {e}")
-            err_data = json.dumps({"token": f"\n\n[Generation error: {str(e)}]"})
+            logger.exception(f"Unhandled exception during stream generation: {e}")
+            fallback_text = "\n\nI encountered an unexpected issue while generating this response. Please try again."
+            err_data = json.dumps({"token": fallback_text})
             yield f"event: token\ndata: {err_data}\n\n"
 
         complete_text = "".join(full_response_text)

@@ -21,23 +21,21 @@ class EmbeddingService:
         self.provider = Config.EMBEDDING_PROVIDER  # "LOCAL" or "GEMINI"
         self.local_model_name = Config.EMBEDDING_MODEL
         self.gemini_model_name = Config.GEMINI_EMBEDDING_MODEL
-        logger.info(f"Initializing EmbeddingService in mode: [{self.provider}]")
-        self._init_models()
+        self._local_model = None
+        logger.info(f"Initialized EmbeddingService configuration (Mode: [{self.provider}])")
 
-    def _init_models(self):
-        # Configure Gemini if API key is present
-        if Config.GEMINI_API_KEY:
+    @property
+    def local_model(self):
+        """Lazy loading property: only loads SentenceTransformer when first needed."""
+        if self._local_model is None:
+            logger.info(f"Lazily loading local embedding model [{self.local_model_name}]...")
             try:
-                genai.configure(api_key=Config.GEMINI_API_KEY)
+                self._local_model = SentenceTransformer(self.local_model_name)
+                logger.info("Local SentenceTransformer model loaded successfully.")
             except Exception as e:
-                logger.warning(f"Could not configure Google GenAI: {e}")
-
-        # Always initialize local model as fallback or primary
-        try:
-            self._local_model = SentenceTransformer(self.local_model_name)
-            logger.info("Local SentenceTransformer model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load local model {self.local_model_name}: {e}")
+                logger.error(f"Failed to load local model {self.local_model_name}: {e}")
+                raise
+        return self._local_model
 
     def embed_text(self, text: str, is_query: bool = False) -> List[float]:
         """
@@ -61,9 +59,13 @@ class EmbeddingService:
                 logger.warning(f"Gemini embedding API call failed: {e}. Falling back to local model.")
 
         # Mode 2: Local SentenceTransformers (Default / Offline / Free)
-        if self._local_model:
-            embedding = self._local_model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
-            return embedding.tolist()
+        try:
+            model = self.local_model
+            if model:
+                embedding = model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+                return embedding.tolist()
+        except Exception as e:
+            logger.error(f"Local embedding failed: {e}")
 
         return []
 
@@ -86,10 +88,15 @@ class EmbeddingService:
                 logger.warning(f"Gemini batch embedding failed: {e}. Using local model.")
 
         # Local mode
-        if self._local_model:
-            embeddings = self._local_model.encode(
-                texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True
-            )
+        try:
+            model = self.local_model
+            if model:
+                embeddings = model.encode(
+                    texts, batch_size=32, show_progress_bar=False, convert_to_numpy=True, normalize_embeddings=True
+                )
+                return embeddings.tolist()
+        except Exception as e:
+            logger.error(f"Local batch embedding failed: {e}")
             return embeddings.tolist()
 
         return [self.embed_text(t) for t in texts]
