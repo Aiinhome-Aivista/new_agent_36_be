@@ -37,6 +37,12 @@ def get_stats():
 
         vector_count = chroma_service.get_count()
 
+        if vector_count != total_functions:
+            logger.warning(
+                f"[Database Discrepancy] MySQL function count ({total_functions}) != ChromaDB vector count ({vector_count}). "
+                f"Sync recommended via /api/knowledge-base/reindex."
+            )
+
         return jsonify({
             "success": True,
             "total_functions": total_functions,
@@ -62,6 +68,7 @@ def list_files():
 def reindex_knowledge_base():
     """Re-indexes all MySQL function records into ChromaDB vector store"""
     try:
+        logger.info("[KnowledgeBase] Starting full search index re-synchronization...")
         chroma_service.clear_collection()
         with db_service.get_session() as session:
             records = session.query(FunctionRecord).all()
@@ -84,15 +91,17 @@ def reindex_knowledge_base():
                 }
                 for r in records
             ]
-            chroma_service.upsert_batch(batch)
+            if batch:
+                chroma_service.upsert_batch(batch)
 
+        logger.info(f"[KnowledgeBase] Re-indexing complete. Synchronized {len(batch)} functions into ChromaDB.")
         return jsonify({
             "success": True,
             "message": f"Successfully re-indexed {len(batch)} functions into ChromaDB.",
             "total_indexed": len(batch)
         })
     except Exception as e:
-        logger.error(f"Re-indexing failed: {e}")
+        logger.exception(f"[KnowledgeBase] Re-indexing failed with error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 @kb_bp.route("/knowledge/save-llm-answer", methods=["POST"])

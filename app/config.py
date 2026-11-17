@@ -41,6 +41,7 @@ class Config:
     # Storage Paths
     UPLOAD_PATH = BASE_DIR / os.getenv("UPLOAD_PATH", "data/uploads")
     CHROMA_PATH = BASE_DIR / os.getenv("CHROMA_PATH", "data/chroma_db")
+    LOGS_PATH = BASE_DIR / os.getenv("LOGS_PATH", "data/logs")
     MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", 50))
     MAX_CONTENT_LENGTH = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
@@ -127,4 +128,5 @@ class Config:
         """Ensures required data and upload directories exist"""
         cls.UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
         cls.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
+        cls.LOGS_PATH.mkdir(parents=True, exist_ok=True)
 

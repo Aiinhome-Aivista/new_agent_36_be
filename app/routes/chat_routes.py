@@ -81,6 +81,7 @@ def chat():
             "retrieved_count": len(retrieved_functions),
             "retrieved_functions": retrieved_functions,
             "thinking_steps": rag_result.get("thinking_steps", []),
+            "grounding_stats": rag_result.get("grounding_stats", {}),
             "latency_ms": rag_result.get("execution_metadata", {}).get("latency_ms", 0)
         }
         yield f"event: metadata\ndata: {json.dumps(meta_payload)}\n\n"
@@ -145,7 +146,11 @@ def get_conversation(session_id):
     with db_service.get_session() as session:
         conv = session.query(Conversation).filter_by(session_id=session_id).first()
         if not conv:
-            return jsonify({"success": False, "error": "Conversation not found"}), 404
+            return jsonify({
+                "success": True,
+                "conversation": None,
+                "messages": []
+            }), 200
 
         messages = [m.to_dict() for m in conv.messages]
         return jsonify({
@@ -160,7 +165,11 @@ def delete_conversation(session_id):
     with db_service.get_session() as session:
         conv = session.query(Conversation).filter_by(session_id=session_id).first()
         if not conv:
-            return jsonify({"success": False, "error": "Conversation not found"}), 404
+            return jsonify({
+                "success": True,
+                "conversation": None,
+                "messages": []
+            }), 200
 
         session.delete(conv)
         return jsonify({"success": True, "message": "Conversation deleted successfully."})

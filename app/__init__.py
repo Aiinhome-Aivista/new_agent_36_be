@@ -1,4 +1,6 @@
+import os
 import logging
+from logging.handlers import RotatingFileHandler
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -10,14 +12,39 @@ from app.routes.chat_routes import chat_bp
 from app.routes.admin_routes import admin_bp
 
 def create_app():
+    # Ensure all directories exist
+    Config.ensure_directories()
+
     # Setup structured logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s",
+    log_formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [%(name)s]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Console handler
+    if not any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(log_formatter)
+        root_logger.addHandler(console_handler)
+
+    # Persistent Rotating File Handler (stores trace logs for easy auditing)
+    log_file = Config.LOGS_PATH / "devknow.log"
+    if not any(isinstance(h, RotatingFileHandler) for h in root_logger.handlers):
+        file_handler = RotatingFileHandler(
+            str(log_file),
+            maxBytes=10 * 1024 * 1024,  # 10 MB per file
+            backupCount=5,
+            encoding="utf-8"
+        )
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
+
     logger = logging.getLogger("DevKnow")
     logger.info("Initializing DevKnow Flask Application...")
+    logger.info(f"Persistent trace logs active at: {log_file}")
 
     app = Flask(__name__)
     app.config.from_object(Config)

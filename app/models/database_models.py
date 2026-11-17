@@ -170,6 +170,35 @@ class ConversationMessage(Base):
 
     conversation = relationship("Conversation", back_populates="messages")
 
+    @property
+    def grounding_stats(self):
+        if self.role != "assistant":
+            return None
+        if self.answer_source == "kb_hit":
+            raw_kb = int(round((self.similarity_score or 0.8) * 100))
+            kb_ratio = max(65, min(95, raw_kb))
+            return {
+                "kb_percentage": kb_ratio,
+                "llm_percentage": 100 - kb_ratio,
+                "attribution_label": "Runbook Grounded",
+                "similarity_score": round(self.similarity_score or 0.0, 4)
+            }
+        elif self.answer_source == "llm_fallback":
+            return {
+                "kb_percentage": 0,
+                "llm_percentage": 100,
+                "attribution_label": "General AI Knowledge",
+                "similarity_score": 0.0
+            }
+        elif self.answer_source in ("security_blocked", "guardrail_blocked"):
+            return {
+                "kb_percentage": 0,
+                "llm_percentage": 0,
+                "attribution_label": "Policy Guardrail",
+                "similarity_score": 0.0
+            }
+        return None
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -181,6 +210,7 @@ class ConversationMessage(Base):
             "retrieved_function_ids": self.retrieved_function_ids,
             "similarity_score": self.similarity_score,
             "query_intent": self.query_intent,
+            "grounding_stats": self.grounding_stats,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
 

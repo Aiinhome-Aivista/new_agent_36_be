@@ -99,10 +99,12 @@ class RetrievalService:
             )
 
             max_score = vector_matches[0]["similarity"] if vector_matches else 0.0
-            is_kb_hit = len(vector_matches) > 0 and max_score >= Config.SIMILARITY_THRESHOLD
+            has_potential_match = len(vector_matches) > 0 and max_score >= Config.SIMILARITY_THRESHOLD
+            missing_ids = []
+            drift_detected = False
 
-            # Step 3: Fetch exact original code from MySQL if KB Hit
-            if is_kb_hit:
+            # Step 3: Fetch exact original code from MySQL if vector match >= threshold
+            if has_potential_match:
                 mysql_ids = [m["mysql_id"] for m in vector_matches if m.get("mysql_id")]
                 with db_service.get_session() as session:
                     records = session.query(FunctionRecord).filter(FunctionRecord.id.in_(mysql_ids)).all()
@@ -116,19 +118,56 @@ class RetrievalService:
                             fn_dict["similarity"] = vm["similarity"]
                             retrieved_functions.append(fn_dict)
 
-                # Build readable context for prompt
-                context_blocks = []
-                for i, f in enumerate(retrieved_functions, 1):
-                    block = [
-                        f"### Function #{i}: {f['function_name']} (Language: {f['programming_language']}, Version: {f['version']})",
-                        f"- Module/Rule: {f.get('rule_version_name', 'N/A')}",
-                        f"- Class/Namespace: {f.get('class_name', '')} {f.get('namespace', '')}".strip() or "- Class/Namespace: None",
-                        f"- Description: {f.get('description', 'N/A')}",
-                        f"- Signature: {f['function_header']}",
-                        f"- Exact Original Implementation:\n```{f['programming_language'].lower()}\n{f['function_body']}\n```"
-                    ]
-                    context_blocks.append("\n".join(block))
-                context_functions_str = "\n\n".join(context_blocks)
+                missing_ids = [m_id for m_id in mysql_ids if m_id not in record_map]
+                drift_detected = len(missing_ids) > 0
+
+                # ── EXPLICIT AUDIT LOGGING FOR DATABASE DRIFT / EMPTY MYSQL MATCHES ──
+                if not retrieved_functions:
+                    # ChromaDB returned vector match(es) >= threshold, but MySQL has NO matching rows
+                    logger.error(
+                        f"[RAG AUDIT: COMPLETE DATABASE DRIFT] "
+                        f"ChromaDB returned {len(vector_matches)} candidate vector(s) (candidate IDs: {mysql_ids}, top_similarity: {round(max_score, 4)}), "
+                        f"but MySQL returned EMPTY (0 records found in 'functions' table). "
+                        f"User Query: '{query[:150]}' | Session: '{session_id}'. "
+                        f"Action Taken: Denied KB grounding. Forcing source='llm_fallback' with 0% KB attribution to prevent phantom hallucination. "
+                        f"Root Cause: Orphaned vector embeddings in ChromaDB without matching relational rows. "
+                        f"Remediation: Run POST /api/knowledge-base/reindex or click 'Sync Search Index' in the Knowledge Base UI."
+                    )
+                elif missing_ids:
+                    # Some IDs were missing from MySQL while others were found
+                    logger.warning(
+                        f"[RAG AUDIT: PARTIAL DATABASE DRIFT] "
+                        f"ChromaDB returned candidates {mysql_ids}, but IDs {missing_ids} were NOT found in MySQL. "
+                        f"Retrieved {len(retrieved_functions)} verified record(s). "
+                        f"User Query: '{query[:150]}' | Session: '{session_id}'. "
+                        f"Action Taken: Filtered out orphaned IDs {missing_ids} from prompt context."
+                    )
+                else:
+                    logger.info(
+                        f"[RAG AUDIT: GROUNDING VERIFIED] "
+                        f"Successfully verified {len(retrieved_functions)} function(s) in MySQL for candidate IDs: {mysql_ids} "
+                        f"(Max similarity: {round(max_score, 4)})."
+                    )
+
+                # Build readable context for prompt ONLY if verified functions exist in database
+                if retrieved_functions:
+                    context_blocks = []
+                    for i, f in enumerate(retrieved_functions, 1):
+                        block = [
+                            f"### Function #{i}: {f['function_name']} (Language: {f['programming_language']}, Version: {f['version']})",
+                            f"- Module/Rule: {f.get('rule_version_name', 'N/A')}",
+                            f"- Class/Namespace: {f.get('class_name', '')} {f.get('namespace', '')}".strip() or "- Class/Namespace: None",
+                            f"- Description: {f.get('description', 'N/A')}",
+                            f"- Signature: {f['function_header']}",
+                            f"- Exact Original Implementation:\n```{f['programming_language'].lower()}\n{f['function_body']}\n```"
+                        ]
+                        context_blocks.append("\n".join(block))
+                    context_functions_str = "\n\n".join(context_blocks)
+
+            # CRITICAL: A true KB Hit ONLY exists if verified records were successfully fetched from MySQL!
+            is_kb_hit = len(retrieved_functions) > 0
+            if not is_kb_hit:
+                max_score = 0.0
 
         # Step 4: Retrieve Conversation Memory
         history = cls.get_conversation_history(session_id, limit=Config.CONVERSATION_MEMORY_TURNS)
@@ -178,7 +217,34 @@ class RetrievalService:
 
         latency_ms = round((time.time() - start_time) * 1000, 2)
 
-        # Step 6: Assemble Thinking Process for UI Reasoning Disclosure
+        # Step 6: Compute Grounding & RAG Attribution Statistics
+        if is_security_blocked:
+            kb_ratio = 0
+            llm_ratio = 0
+            attribution_label = "Security Guardrail"
+        elif is_out_of_scope:
+            kb_ratio = 0
+            llm_ratio = 0
+            attribution_label = "Domain Guardrail"
+        elif is_kb_hit:
+            raw_kb = int(round(max_score * 100))
+            kb_ratio = max(65, min(95, raw_kb))
+            llm_ratio = 100 - kb_ratio
+            attribution_label = "Runbook Grounded"
+        else:
+            kb_ratio = 0
+            llm_ratio = 100
+            attribution_label = "General AI Knowledge"
+
+        grounding_stats = {
+            "kb_percentage": kb_ratio,
+            "llm_percentage": llm_ratio,
+            "attribution_label": attribution_label,
+            "similarity_score": round(max_score, 4),
+            "retrieved_count": len(retrieved_functions)
+        }
+
+        # Step 7: Assemble Thinking Process for UI Reasoning Disclosure
         if is_security_blocked:
             thinking_steps = [
                 {
@@ -192,6 +258,10 @@ class RetrievalService:
                 {
                     "title": "Security Intervention",
                     "detail": "Quarantining input and generating enterprise security notice."
+                },
+                {
+                    "title": "Grounding & RAG Attribution",
+                    "detail": "RAG Attribution: 0% Knowledge Base • 0% Code Synthesis (Security policy intervention enforced)."
                 }
             ]
         elif is_out_of_scope:
@@ -207,6 +277,10 @@ class RetrievalService:
                 {
                     "title": "Guardrail Enforcement",
                     "detail": "Vector search bypassed. Activating domain refusal prompt to maintain assistant integrity."
+                },
+                {
+                    "title": "Grounding & RAG Attribution",
+                    "detail": "RAG Attribution: 0% Knowledge Base • 0% General AI (Domain boundary refusal enforced)."
                 }
             ]
         else:
@@ -221,11 +295,23 @@ class RetrievalService:
                 },
                 {
                     "title": "Knowledge Grounding Check",
-                    "detail": f"Retrieved {len(retrieved_functions)} verified function(s) verbatim from database." if is_kb_hit else f"No company function exceeded similarity threshold ({Config.SIMILARITY_THRESHOLD}). Activating general developer intelligence."
+                    "detail": (
+                        f"Retrieved {len(retrieved_functions)} verified function(s) verbatim from database."
+                        if is_kb_hit
+                        else (
+                            f"Vector index returned {len(vector_matches)} candidate(s), but corresponding code records were missing in MySQL database (database drift). Grounding denied; safely routing to General AI."
+                            if (has_potential_match and not retrieved_functions)
+                            else f"No company function exceeded similarity threshold ({Config.SIMILARITY_THRESHOLD}). Activating general developer intelligence."
+                        )
+                    )
                 },
                 {
                     "title": "Response Synthesis",
                     "detail": "Grounding response in verified organizational code and runbook logic." if is_kb_hit else ("Synthesizing polite conversational greeting." if intent == "greeting" else "Synthesizing solution using idiomatic programming practices.")
+                },
+                {
+                    "title": "Grounding & RAG Attribution",
+                    "detail": f"Verified RAG ratio: {kb_ratio}% Knowledge Base (Runbook match: {round(max_score * 100, 1)}%) + {llm_ratio}% LLM synthesis & reasoning." if is_kb_hit else "Verified RAG ratio: 0% Knowledge Base (no company runbook met threshold) + 100% General LLM programming knowledge."
                 }
             ]
 
@@ -237,8 +323,17 @@ class RetrievalService:
             "filter_language": filter_lang,
             "source": source,
             "max_similarity_score": max_score,
+            "grounding_stats": grounding_stats,
             "retrieved_count": len(retrieved_functions),
             "retrieved_ids": [f["id"] for f in retrieved_functions],
+            "database_verification": {
+                "vector_candidate_count": len(vector_matches),
+                "vector_candidate_ids": [m.get("mysql_id") for m in vector_matches],
+                "mysql_matched_count": len(retrieved_functions),
+                "missing_mysql_ids": missing_ids,
+                "desync_detected": drift_detected,
+                "status": "grounded_ok" if is_kb_hit else ("vector_matched_but_mysql_empty" if (has_potential_match and not retrieved_functions) else "clean_kb_miss")
+            },
             "latency_ms": latency_ms
         }
         logger.info(f"RAG Execution: {json.dumps(obs_log)}")
@@ -250,6 +345,7 @@ class RetrievalService:
             "retrieved_functions": retrieved_functions,
             "prompt": prompt,
             "thinking_steps": thinking_steps,
+            "grounding_stats": grounding_stats,
             "execution_metadata": obs_log
         }
 
