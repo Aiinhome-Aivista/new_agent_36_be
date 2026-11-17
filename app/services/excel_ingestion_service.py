@@ -10,23 +10,30 @@ from app.utils.excel_validator import ExcelValidator
 from app.utils.language_detector import detect_language_from_code
 from app.services.mysql_service import db_service
 from app.services.chroma_service import chroma_service
+from app.services.code_parser_service import code_parser
 from app.models.database_models import KnowledgeBaseFile, FunctionRecord, IngestionLog
 
 logger = logging.getLogger("DevKnow.Ingestion")
 
 class ExcelIngestionService:
     @staticmethod
-    def extract_function_name(header_text: str) -> str:
-        """Extracts candidate function name from a header/signature string"""
+    def extract_function_name(header_text: str, language: str = None) -> str:
+        """Extracts candidate function name using AST / Tree-sitter with regex fallback"""
         if not header_text:
             return "anonymous_function"
+
+        # Try AST / Tree-sitter first for precise parsing
+        try:
+            meta = code_parser.parse_function_metadata(header_text, language)
+            if meta and meta.get("function_name") and meta["function_name"] != "unnamed_function":
+                return meta["function_name"]
+        except Exception:
+            pass
+
         header = header_text.strip()
-        # Look for pattern like: return_type FunctionName(args) or def func_name(
-        # e.g., bool IsRealBreakerPart(AtomicPart part)
         match = re.search(r"(\w+)\s*\(", header)
         if match:
             return match.group(1)
-        # Or words separated by spaces, take last token before paren or first token
         first_line = header.split("\n")[0].split("(")[0].strip()
         tokens = first_line.split()
         if tokens:
@@ -107,10 +114,6 @@ class ExcelIngestionService:
                         session.add(log)
                         continue
 
-                    rule_name = str(row[rule_name_col]).strip() if rule_name_col and pd.notna(row.get(rule_name_col)) else ""
-                    rule_desc = str(row[rule_desc_col]).strip() if rule_desc_col and pd.notna(row.get(rule_desc_col)) else ""
-                    func_name = cls.extract_function_name(header_val)
-
                     # Programming language resolution
                     lang_val = ""
                     if lang_col and pd.notna(row.get(lang_col)):
@@ -123,6 +126,10 @@ class ExcelIngestionService:
                         lang_val = lang_val.lower()
 
                     all_languages.add(lang_val)
+
+                    rule_name = str(row[rule_name_col]).strip() if rule_name_col and pd.notna(row.get(rule_name_col)) else ""
+                    rule_desc = str(row[rule_desc_col]).strip() if rule_desc_col and pd.notna(row.get(rule_desc_col)) else ""
+                    func_name = cls.extract_function_name(header_val, lang_val)
 
                     framework_val = str(row[framework_col]).strip() if framework_col and pd.notna(row.get(framework_col)) else ""
                     ver_val = str(row[ver_col]).strip() if ver_col and pd.notna(row.get(ver_col)) else "1.0.0"

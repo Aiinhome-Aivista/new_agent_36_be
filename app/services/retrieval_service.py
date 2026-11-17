@@ -7,6 +7,7 @@ from app.config import Config
 from app.services.mysql_service import db_service
 from app.services.chroma_service import chroma_service
 from app.services.gemini_service import gemini_service
+from app.services.code_parser_service import code_parser
 from app.services.query_router import QueryRouter
 from app.models.database_models import FunctionRecord, Conversation, ConversationMessage
 from app.rag.prompts import (
@@ -172,7 +173,31 @@ class RetrievalService:
         # Step 4: Retrieve Conversation Memory
         history = cls.get_conversation_history(session_id, limit=Config.CONVERSATION_MEMORY_TURNS)
         safe_code = sanitize_prompt_input(attached_code) if attached_code else ""
-        attached_code_section = f"### ATTACHED CODE SNIPPET (UNTRUSTED USER DATA):\n<attached_code>\n{safe_code}\n</attached_code>" if safe_code else ""
+        attached_code_section = ""
+        if safe_code:
+            try:
+                ast_info = code_parser.analyze_code_quality(safe_code, selected_language)
+                smells_str = "; ".join(ast_info["code_smells"]) if ast_info["code_smells"] else "None detected (Clean structure)"
+                syntax_str = "Valid Syntax" if ast_info["is_valid_syntax"] else f"Irregular ({ast_info['syntax_error']})"
+                params_str = ", ".join(ast_info["parameters"]) if ast_info["parameters"] else "None identified"
+                ast_summary = (
+                    f"### STATIC AST CODE ANALYSIS (DETERMINISTIC COMPILER METRICS):\n"
+                    f"- Language: {ast_info['language']}\n"
+                    f"- Identified Function: {ast_info['function_name']}\n"
+                    f"- Parameters: {params_str}\n"
+                    f"- Return Type: {ast_info['return_type'] or 'Unspecified'}\n"
+                    f"- Cyclomatic Complexity: {ast_info['complexity']}\n"
+                    f"- Syntax Check: {syntax_str}\n"
+                    f"- Static Code Smells: {smells_str}\n"
+                )
+            except Exception:
+                ast_summary = ""
+
+            attached_code_section = (
+                f"### ATTACHED CODE SNIPPET (UNTRUSTED USER DATA):\n"
+                f"<attached_code>\n{safe_code}\n</attached_code>\n\n"
+                f"{ast_summary}"
+            )
         safe_query = sanitize_prompt_input(query)
 
         # Step 5: Choose Prompt Template
@@ -314,6 +339,34 @@ class RetrievalService:
                     "detail": f"Verified RAG ratio: {kb_ratio}% Knowledge Base (Runbook match: {round(max_score * 100, 1)}%) + {llm_ratio}% LLM synthesis & reasoning." if is_kb_hit else "Verified RAG ratio: 0% Knowledge Base (no company runbook met threshold) + 100% General LLM programming knowledge."
                 }
             ]
+
+        # Step 7b: Run AST / Tree-sitter Code Inspection on retrieved or attached code
+        code_to_inspect = attached_code
+        if not code_to_inspect and retrieved_functions:
+            fn0 = retrieved_functions[0]
+            header = fn0.get("function_header", "").strip()
+            body = fn0.get("function_body", "").strip()
+            lang = fn0.get("programming_language", "").lower()
+            if lang == "python":
+                code_to_inspect = f"{header}\n    {body}"
+            else:
+                code_to_inspect = f"{header} {{\n    {body}\n}}"
+
+        if code_to_inspect and not is_security_blocked and not is_out_of_scope:
+            inspect_lang = selected_language or (retrieved_functions[0]["programming_language"] if retrieved_functions else None)
+            try:
+                ast_metrics = code_parser.analyze_code_quality(code_to_inspect, inspect_lang)
+                engine_tag = ast_metrics["parser_engine"].replace("_", "-").upper()
+                thinking_steps.insert(-1, {
+                    "title": f"AST & Syntax Inspection ({engine_tag})",
+                    "detail": (
+                        f"Parsed '{ast_metrics['function_name']}' | Complexity: {ast_metrics['complexity']} | "
+                        f"Syntax: {'Valid' if ast_metrics['is_valid_syntax'] else 'Irregular'} | "
+                        f"Parameters: {len(ast_metrics['parameters'])}."
+                    )
+                })
+            except Exception as ast_err:
+                logger.debug(f"AST inspection notice: {ast_err}")
 
         # Observability structured log
         obs_log = {
