@@ -16,6 +16,7 @@ logger = logging.getLogger("DevKnow.LLM")
 class LLMService:
     _instance = None
     _gemini_model = None
+    _gemini_fallback_model = None
 
     @classmethod
     def get_instance(cls):
@@ -46,9 +47,23 @@ class LLMService:
                         generation_config=generation_config
                     )
                     logger.info(f"Gemini client initialized with model: {Config.GEMINI_MODEL}")
+
+                    # Initialize automatic failover model for high-demand spikes (503/429)
+                    fallback_name = "gemini-flash-latest" if Config.GEMINI_MODEL != "gemini-flash-latest" else "gemini-2.5-flash"
+                    try:
+                        self._gemini_fallback_model = genai.GenerativeModel(
+                            model_name=fallback_name,
+                            system_instruction=BASE_GUARDRAIL_SYSTEM_PROMPT,
+                            generation_config=generation_config
+                        )
+                        logger.info(f"Gemini failover client initialized with model: {fallback_name}")
+                    except Exception as fb_init_err:
+                        logger.warning(f"Could not initialize failover Gemini model: {fb_init_err}")
+                        self._gemini_fallback_model = None
                 except Exception as e:
                     logger.error(f"Failed to initialize Gemini client: {e}")
                     self._gemini_model = None
+                    self._gemini_fallback_model = None
 
     def stream_generate(self, prompt: str) -> Generator[str, None, None]:
         """
@@ -95,6 +110,7 @@ class LLMService:
             yield self._get_graceful_fallback(prompt)
             return
 
+        tokens_yielded = 0
         try:
             response = self._gemini_model.generate_content(prompt, stream=True)
             for chunk in response:
@@ -104,15 +120,38 @@ class LLMService:
                             if cand.content and cand.content.parts:
                                 for part in cand.content.parts:
                                     if hasattr(part, "text") and part.text:
+                                        tokens_yielded += 1
                                         yield part.text
                     elif hasattr(chunk, "text") and chunk.text:
+                        tokens_yielded += 1
                         yield chunk.text
                 except (ValueError, AttributeError) as ve:
                     logger.debug(f"Candidate part extraction notice: {ve}")
                     continue
         except Exception as e:
-            logger.exception(f"Error streaming from Gemini: {e}")
-            yield self._get_graceful_fallback(prompt)
+            logger.exception(f"Error streaming from Gemini primary model ({Config.GEMINI_MODEL}): {e}")
+            # If no tokens have been emitted yet and a failover model exists, try failover seamlessly
+            if tokens_yielded == 0 and self._gemini_fallback_model:
+                logger.info("Attempting seamless failover to secondary Gemini model...")
+                try:
+                    fb_response = self._gemini_fallback_model.generate_content(prompt, stream=True)
+                    for chunk in fb_response:
+                        if chunk.candidates:
+                            for cand in chunk.candidates:
+                                if cand.content and cand.content.parts:
+                                    for part in cand.content.parts:
+                                        if hasattr(part, "text") and part.text:
+                                            tokens_yielded += 1
+                                            yield part.text
+                    return
+                except Exception as fb_err:
+                    logger.exception(f"Secondary model failover also failed: {fb_err}")
+
+            if tokens_yielded > 0:
+                # Close any dangling code blocks and format cleanly
+                yield "\n```\n\n> ⚠️ **Service Notice**: *The response stream was interrupted by a temporary cloud provider spike (HTTP 503 Service Unavailable). Please submit your query again to complete the remaining code.*"
+            else:
+                yield self._get_graceful_fallback(prompt)
 
     # ── 2. OpenAI (ChatGPT / GPT-4o) Streaming ──────────────────────────────
     def _stream_openai(self, prompt: str) -> Generator[str, None, None]:
