@@ -98,8 +98,18 @@ class LLMService:
         try:
             response = self._gemini_model.generate_content(prompt, stream=True)
             for chunk in response:
-                if chunk.text:
-                    yield chunk.text
+                try:
+                    if chunk.candidates:
+                        for cand in chunk.candidates:
+                            if cand.content and cand.content.parts:
+                                for part in cand.content.parts:
+                                    if hasattr(part, "text") and part.text:
+                                        yield part.text
+                    elif hasattr(chunk, "text") and chunk.text:
+                        yield chunk.text
+                except (ValueError, AttributeError) as ve:
+                    logger.debug(f"Candidate part extraction notice: {ve}")
+                    continue
         except Exception as e:
             logger.exception(f"Error streaming from Gemini: {e}")
             yield self._get_graceful_fallback(prompt)

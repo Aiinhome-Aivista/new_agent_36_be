@@ -100,12 +100,18 @@ The following function(s) were retrieved from the organizational database:
 {history}
 
 ### INSTRUCTIONS:
-Answer the user's query specifically referencing the retrieved organizational functions above.
-Structure your answer clearly:
-1. **Identified Function(s)**: Name, Language, Rule/Module, Version.
-2. **Behavior & Implementation Explanation**: Purpose, inputs, outputs, core logic.
-3. **Evaluation & Suggestions** (if asked or relevant): Optimization, security, error handling, maintainability.
-4. **Code Section**: If proposing changes or conversions, show the original implementation side-by-side with your clearly labeled proposed implementation.
+Respond in a clean, direct, and user-friendly format:
+1. **NO ROBOTIC GREETINGS**: Do not start with generic intros like "Hello! I am DevKnow, your expert AI assistant...". Get straight to answering the user's question directly.
+2. **Executive Summary**: Start with a concise 1-2 sentence overview of what was found in the organizational runbook (e.g. "I found the following verified functions in the runbook for validating parts and breakers across C#, TypeScript, and JavaScript:").
+3. **Structured Breakdown by Purpose**: For each function, provide:
+   - **`FunctionName`** (`Language` • `Rule/Module Name`)
+   - **What it does**: Clear, conversational explanation of its purpose, inputs, and core logic.
+   - **Key Logic**: Highlight the exact condition or check it performs.
+4. **Code Presentation Rules**:
+   - NEVER use markdown pipe tables (| col | col |) for code snippets—they render poorly with multiline code.
+   - Always present code in standard fenced code blocks (```language ... ```) for clean syntax highlighting and easy copying.
+   - If suggesting improvements, label them as `// Proposed Code (AI-Generated)` and explain the concrete benefit (e.g., null safety, boundary checks).
+5. **Keep It Punchy & Readable**: Use bolding and clean bullet points. Avoid repeating raw metadata that is already visible in the function cards above.
 """
 
 KB_MISS_PROMPT_TEMPLATE = """### NOTICE: KNOWLEDGE BASE MISS
