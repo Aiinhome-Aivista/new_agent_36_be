@@ -1,4 +1,9 @@
 import os
+import warnings
+
+# Suppress legacy package deprecation notice in console
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 from app import create_app
 from app.config import Config
 

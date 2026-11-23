@@ -34,7 +34,8 @@ class DatabaseService:
                     port=url.port or 3306,
                     user=url.username or "root",
                     password=url.password or "",
-                    charset="utf8mb4"
+                    charset="utf8mb4",
+                    connect_timeout=5
                 )
                 with conn.cursor() as cursor:
                     cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{url.database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;")

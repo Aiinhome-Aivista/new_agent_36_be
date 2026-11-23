@@ -4,7 +4,7 @@ from typing import List, Union
 from sentence_transformers import SentenceTransformer
 
 # Suppress legacy package deprecation notice in console
-warnings.filterwarnings("ignore", category=FutureWarning, module="google.generativeai")
+warnings.filterwarnings("ignore", category=FutureWarning)
 import google.generativeai as genai
 
 from app.config import Config

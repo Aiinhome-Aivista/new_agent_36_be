@@ -1,3 +1,5 @@
+import os
+import sqlite3
 import logging
 from typing import List, Dict, Any, Optional
 import chromadb
@@ -24,21 +26,54 @@ class ChromaService:
         Config.ensure_directories()
         self._init_client()
 
+    def _repair_sqlite_fts(self):
+        """Auto-repairs corrupted SQLite FTS5 shadow tables for ChromaDB metadata segment."""
+        db_file = os.path.join(self.chroma_path, "chroma.sqlite3")
+        if not os.path.exists(db_file):
+            return
+        logger.warning(f"Attempting automated repair of Chroma SQLite FTS tables at {db_file}...")
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        cur.execute("PRAGMA writable_schema = ON;")
+        cur.execute("DELETE FROM sqlite_schema WHERE name LIKE 'embedding_fulltext_search%';")
+        cur.execute("PRAGMA writable_schema = OFF;")
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(db_file)
+        cur = conn.cursor()
+        cur.execute("VACUUM;")
+        conn.commit()
+        cur.execute("CREATE VIRTUAL TABLE embedding_fulltext_search USING fts5(string_value, tokenize='trigram');")
+        conn.commit()
+        conn.close()
+        logger.info("Automated repair of Chroma SQLite FTS tables completed successfully.")
+
     def _init_client(self):
-        try:
-            self._client = chromadb.PersistentClient(
-                path=self.chroma_path,
-                settings=Settings(anonymized_telemetry=False)
-            )
-            # Collection name for functions
-            self._collection = self._client.get_or_create_collection(
-                name="devknow_functions",
-                metadata={"hnsw:space": "cosine"}
-            )
-            logger.info(f"ChromaDB initialized at {self.chroma_path}. Collection count: {self._collection.count()}")
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB: {e}")
-            raise
+        for attempt in range(2):
+            try:
+                self._client = chromadb.PersistentClient(
+                    path=self.chroma_path,
+                    settings=Settings(anonymized_telemetry=False)
+                )
+                # Collection name for functions
+                self._collection = self._client.get_or_create_collection(
+                    name="devknow_functions",
+                    metadata={"hnsw:space": "cosine"}
+                )
+                logger.info(f"ChromaDB initialized at {self.chroma_path}. Collection count: {self._collection.count()}")
+                return
+            except Exception as e:
+                err_str = str(e).lower()
+                if attempt == 0 and ("metadata segment" in err_str or "vtable constructor failed" in err_str):
+                    logger.warning(f"ChromaDB metadata segment issue detected ({e}). Attempting auto-repair...")
+                    try:
+                        self._repair_sqlite_fts()
+                        continue
+                    except Exception as repair_err:
+                        logger.error(f"Failed automated repair of Chroma SQLite: {repair_err}")
+                logger.error(f"Failed to initialize ChromaDB: {e}")
+                raise
 
     def build_search_document(
         self,
