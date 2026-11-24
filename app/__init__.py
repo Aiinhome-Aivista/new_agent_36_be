@@ -10,6 +10,7 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 
 from app.config import Config
+from app.utils.response_helper import error_response
 from app.routes.upload_routes import upload_bp
 from app.routes.knowledge_base_routes import kb_bp
 from app.routes.function_routes import function_bp
@@ -80,13 +81,13 @@ def create_app() -> Flask:
     # Standardized 404 handler returning JSON instead of default HTML
     @app.errorhandler(404)
     def not_found(e):
-        return jsonify({"success": False, "error": "Endpoint not found"}), 404
+        return error_response(message="Endpoint not found", status_code=404)
 
     # Standardized 500 handler logging exception details and returning clean JSON
     @app.errorhandler(500)
     def internal_error(e):
         logger.error(f"Internal server error: {e}")
-        return jsonify({"success": False, "error": "Internal server error"}), 500
+        return error_response(message="Internal server error", status_code=500)
 
     logger.info("DevKnow Flask Application ready.")
     return app

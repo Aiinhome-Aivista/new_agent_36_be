@@ -17,12 +17,13 @@ Provides conversational AI and Retrieval-Augmented Generation (RAG) endpoints:
 import json
 import uuid
 import logging
-from flask import Blueprint, request, Response, stream_with_context, jsonify
+from flask import Blueprint, request, Response, stream_with_context
 
 from app.services.mysql_service import db_service
 from app.services.retrieval_service import RetrievalService
 from app.services.gemini_service import gemini_service
 from app.models.database_models import Conversation, ConversationMessage
+from app.utils.response_helper import success_response, error_response
 
 chat_bp = Blueprint("chat", __name__)
 logger = logging.getLogger("DevKnow.ChatRoutes")
@@ -50,7 +51,7 @@ def chat():
 
     Responses:
         200: text/event-stream Response object.
-        400: Empty query or query exceeding character limit.
+        400: Standardized error envelope if query is empty or too long.
     """
     data = request.get_json() or {}
     query = data.get("query", "").strip()
@@ -60,10 +61,10 @@ def chat():
 
     # Input guardrail checks
     if not query:
-        return jsonify({"success": False, "error": "Query cannot be empty"}), 400
+        return error_response(message="Query cannot be empty", status_code=400)
 
     if len(query) > 4000:
-        return jsonify({"success": False, "error": "Query exceeds maximum limit of 4000 characters"}), 400
+        return error_response(message="Query exceeds maximum limit of 4000 characters", status_code=400)
 
     if not session_id:
         session_id = str(uuid.uuid4())
@@ -168,14 +169,15 @@ def list_conversations():
     Returns the 20 most recent conversation sessions.
 
     Responses:
-        200: JSON list of Conversation records.
+        200: Standardized JSON envelope with list of Conversation records.
     """
     with db_service.get_session() as session:
         convs = session.query(Conversation).order_by(Conversation.updated_at.desc()).limit(20).all()
-        return jsonify({
-            "success": True,
-            "conversations": [c.to_dict() for c in convs]
-        })
+        return success_response(
+            message=f"Retrieved {len(convs)} conversation session(s)",
+            status_code=200,
+            conversations=[c.to_dict() for c in convs]
+        )
 
 
 @chat_bp.route("/conversations/<session_id>", methods=["GET"])
@@ -187,23 +189,25 @@ def get_conversation(session_id: str):
         session_id: UUID of the conversation session.
 
     Responses:
-        200: JSON object containing conversation metadata and list of messages.
+        200: Standardized JSON envelope with conversation metadata and list of messages.
     """
     with db_service.get_session() as session:
         conv = session.query(Conversation).filter_by(session_id=session_id).first()
         if not conv:
-            return jsonify({
-                "success": True,
-                "conversation": None,
-                "messages": []
-            }), 200
+            return success_response(
+                message="Conversation not found or empty",
+                status_code=200,
+                conversation=None,
+                messages=[]
+            )
 
         messages = [m.to_dict() for m in conv.messages]
-        return jsonify({
-            "success": True,
-            "conversation": conv.to_dict(),
-            "messages": messages
-        })
+        return success_response(
+            message=f"Retrieved {len(messages)} message(s) for session {session_id[:8]}",
+            status_code=200,
+            conversation=conv.to_dict(),
+            messages=messages
+        )
 
 
 @chat_bp.route("/conversations/<session_id>", methods=["DELETE"])
@@ -220,11 +224,15 @@ def delete_conversation(session_id: str):
     with db_service.get_session() as session:
         conv = session.query(Conversation).filter_by(session_id=session_id).first()
         if not conv:
-            return jsonify({
-                "success": True,
-                "conversation": None,
-                "messages": []
-            }), 200
+            return success_response(
+                message="Conversation not found or already deleted",
+                status_code=200,
+                conversation=None,
+                messages=[]
+            )
 
         session.delete(conv)
-        return jsonify({"success": True, "message": "Conversation deleted successfully."})
+        return success_response(
+            message="Conversation deleted successfully.",
+            status_code=200
+        )

@@ -14,7 +14,7 @@ Provides management, observability, and administrative review endpoints:
 """
 
 import logging
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request
 from sqlalchemy import func
 
 from app.services.mysql_service import db_service
@@ -22,6 +22,7 @@ from app.services.chroma_service import chroma_service
 from app.services.kb_growth_service import KBGrowthService
 from app.services.code_doc_ingestion_service import CodeDocIngestionService
 from app.models.database_models import KnowledgeBaseFile, FunctionRecord, LLMGeneratedKnowledge
+from app.utils.response_helper import success_response, error_response
 
 kb_bp = Blueprint("knowledge_base", __name__)
 logger = logging.getLogger("DevKnow.KBRoutes")
@@ -41,7 +42,7 @@ def get_stats():
     - 5 most recently uploaded knowledge files.
 
     Responses:
-        200: JSON object containing dashboard counts and language distribution.
+        200: Standardized JSON envelope containing dashboard counts and language distribution.
     """
     with db_service.get_session() as session:
         total_functions = session.query(func.count(FunctionRecord.id)).scalar() or 0
@@ -73,16 +74,17 @@ def get_stats():
                 f"Sync recommended via POST /api/knowledge-base/reindex."
             )
 
-        return jsonify({
-            "success": True,
-            "total_functions": total_functions,
-            "excel_functions": excel_functions,
-            "llm_functions": llm_functions,
-            "total_files": total_files,
-            "vector_index_count": vector_count,
-            "languages_distribution": languages_distribution,
-            "recent_files": [f.to_dict() for f in recent_files]
-        })
+        return success_response(
+            message="Knowledge base statistics retrieved successfully",
+            status_code=200,
+            total_functions=total_functions,
+            excel_functions=excel_functions,
+            llm_functions=llm_functions,
+            total_files=total_files,
+            vector_index_count=vector_count,
+            languages_distribution=languages_distribution,
+            recent_files=[f.to_dict() for f in recent_files]
+        )
 
 
 @kb_bp.route("/knowledge-base/files", methods=["GET"])
@@ -91,14 +93,15 @@ def list_files():
     Returns a list of all uploaded knowledge base files and spreadsheets.
 
     Responses:
-        200: JSON list of KnowledgeBaseFile records ordered by upload date descending.
+        200: Standardized JSON envelope with KnowledgeBaseFile records.
     """
     with db_service.get_session() as session:
         files = session.query(KnowledgeBaseFile).order_by(KnowledgeBaseFile.uploaded_at.desc()).all()
-        return jsonify({
-            "success": True,
-            "files": [f.to_dict() for f in files]
-        })
+        return success_response(
+            message=f"Retrieved {len(files)} uploaded file(s)",
+            status_code=200,
+            files=[f.to_dict() for f in files]
+        )
 
 
 @kb_bp.route("/knowledge-base/reindex", methods=["POST"])
@@ -143,14 +146,17 @@ def reindex_knowledge_base():
                 chroma_service.upsert_batch(batch)
 
         logger.info(f"[KnowledgeBase] Re-indexing complete. Synchronized {len(batch)} functions into ChromaDB.")
-        return jsonify({
-            "success": True,
-            "message": f"Successfully re-indexed {len(batch)} functions into ChromaDB.",
-            "total_indexed": len(batch)
-        })
+        return success_response(
+            message=f"Successfully re-indexed {len(batch)} functions into ChromaDB.",
+            status_code=200,
+            total_indexed=len(batch)
+        )
     except Exception as e:
         logger.exception(f"[KnowledgeBase] Re-indexing failed with error: {e}")
-        return jsonify({"success": False, "error": str(e)}), 500
+        return error_response(
+            message=f"Re-indexing failed: {str(e)}",
+            status_code=500
+        )
 
 
 @kb_bp.route("/knowledge/save-llm-answer", methods=["POST"])
@@ -174,7 +180,10 @@ def save_llm_answer():
     llm_answer = data.get("llm_answer", "").strip()
 
     if not query or not llm_answer:
-        return jsonify({"success": False, "error": "Query and LLM answer are required"}), 400
+        return error_response(
+            message="Query and LLM answer are required",
+            status_code=400
+        )
 
     result = KBGrowthService.save_llm_answer_to_kb(
         original_query=query,
@@ -190,7 +199,11 @@ def save_llm_answer():
         user_decision="accepted"
     )
 
-    return jsonify(result), 200
+    return success_response(
+        message=result.get("message", "Solution staged for review"),
+        status_code=200,
+        **result
+    )
 
 
 @kb_bp.route("/knowledge/llm-generated", methods=["GET"])
@@ -199,14 +212,19 @@ def list_llm_generated():
     Returns all functions originally created via LLM chat interactions.
 
     Responses:
-        200: JSON list of LLM-generated function records.
+        200: Standardized JSON envelope with list of LLM-generated function records.
     """
     records = KBGrowthService.list_llm_generated()
-    return jsonify({"success": True, "count": len(records), "records": records})
+    return success_response(
+        message=f"Retrieved {len(records)} AI-learned function(s)",
+        status_code=200,
+        count=len(records),
+        records=records
+    )
 
 
 @kb_bp.route("/knowledge/llm-generated/<int:func_id>", methods=["DELETE"])
-def delete_llm_generated(func_id):
+def delete_llm_generated(func_id: int):
     """
     Removes an LLM-generated record from the database and vector store.
 
@@ -219,8 +237,14 @@ def delete_llm_generated(func_id):
     """
     success = KBGrowthService.delete_llm_generated(func_id)
     if success:
-        return jsonify({"success": True, "message": f"Record {func_id} removed from KB."})
-    return jsonify({"success": False, "error": "Record not found or not LLM-generated"}), 404
+        return success_response(
+            message=f"Record {func_id} removed from KB successfully.",
+            status_code=200
+        )
+    return error_response(
+        message="Record not found or not LLM-generated",
+        status_code=404
+    )
 
 
 # ── Human-in-the-Loop Review Queue Endpoints ─────────────────────────────────
@@ -238,15 +262,16 @@ def get_staging_queue():
     """
     status = request.args.get("status", "pending_review")
     items = CodeDocIngestionService.list_staging_queue(status=status)
-    return jsonify({
-        "success": True,
-        "count": len(items),
-        "items": items
-    }), 200
+    return success_response(
+        message=f"Retrieved {len(items)} staged item(s) with status '{status}'",
+        status_code=200,
+        count=len(items),
+        items=items
+    )
 
 
 @kb_bp.route("/knowledge-base/staging-queue/<int:func_id>/approve", methods=["POST"])
-def approve_staged_function(func_id):
+def approve_staged_function(func_id: int):
     """
     Human verification action: Approves a function in the staging queue.
     Updates `verification_status` to 'verified' and indexes into ChromaDB.
@@ -271,12 +296,21 @@ def approve_staged_function(func_id):
         approved_version=approved_version,
         notes=notes
     )
-    status_code = 200 if res.get("success") else 400
-    return jsonify(res), status_code
+    if res.get("success"):
+        return success_response(
+            message=res.get("message", "Function approved successfully"),
+            status_code=200,
+            **res
+        )
+    return error_response(
+        message=res.get("error", "Failed to approve function"),
+        status_code=400,
+        **res
+    )
 
 
 @kb_bp.route("/knowledge-base/staging-queue/<int:func_id>/reject", methods=["POST"])
-def reject_staged_function(func_id):
+def reject_staged_function(func_id: int):
     """
     Human verification action: Rejects a function in the staging queue.
     Marks `verification_status` as 'rejected' and excludes it from ChromaDB.
@@ -298,5 +332,14 @@ def reject_staged_function(func_id):
         function_id=func_id,
         reason=reason
     )
-    status_code = 200 if res.get("success") else 400
-    return jsonify(res), status_code
+    if res.get("success"):
+        return success_response(
+            message=res.get("message", "Function rejected"),
+            status_code=200,
+            **res
+        )
+    return error_response(
+        message=res.get("error", "Failed to reject function"),
+        status_code=400,
+        **res
+    )

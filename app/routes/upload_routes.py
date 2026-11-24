@@ -13,13 +13,14 @@ Provides HTTP endpoints for ingesting knowledge files:
 import os
 import uuid
 import logging
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request
 from werkzeug.utils import secure_filename
 
 from app.config import Config
 from app.utils.excel_validator import ExcelValidator
 from app.services.excel_ingestion_service import ExcelIngestionService
 from app.services.code_doc_ingestion_service import CodeDocIngestionService
+from app.utils.response_helper import success_response, error_response
 
 upload_bp = Blueprint("upload", __name__)
 logger = logging.getLogger("DevKnow.UploadRoutes")
@@ -41,22 +42,22 @@ def upload_knowledge_base():
         multipart/form-data with key 'file' (.xlsx or .xls)
 
     Responses:
-        200: Successfully parsed and ingested file with detailed statistics.
+        200: Standardized JSON envelope with ingestion summary.
         400: Missing file, invalid extension, or malformed spreadsheet columns.
         500: Server-side I/O or ingestion processing error.
     """
     if "file" not in request.files:
-        return jsonify({"success": False, "error": "No file part in request"}), 400
+        return error_response(message="No file part in request", status_code=400)
 
     file = request.files["file"]
     if file.filename == "":
-        return jsonify({"success": False, "error": "No file selected"}), 400
+        return error_response(message="No file selected", status_code=400)
 
     if not ExcelValidator.allowed_file(file.filename):
-        return jsonify({
-            "success": False,
-            "error": "Invalid file extension. Only .xlsx and .xls files are supported."
-        }), 400
+        return error_response(
+            message="Invalid file extension. Only .xlsx and .xls files are supported.",
+            status_code=400
+        )
 
     Config.ensure_directories()
     original_filename = secure_filename(file.filename)
@@ -72,12 +73,24 @@ def upload_knowledge_base():
             original_filename=original_filename
         )
 
-        status_code = 200 if summary.get("success") else 400
-        return jsonify(summary), status_code
+        if summary.get("success"):
+            return success_response(
+                message=f"File '{original_filename}' ingested successfully. {summary.get('successful_records', 0)} functions indexed.",
+                status_code=200,
+                **summary
+            )
+        return error_response(
+            message=summary.get("error", "Excel ingestion failed"),
+            status_code=400,
+            **summary
+        )
 
     except Exception as e:
         logger.error(f"Error handling file upload: {e}")
-        return jsonify({"success": False, "error": f"Upload processing error: {str(e)}"}), 500
+        return error_response(
+            message=f"Upload processing error: {str(e)}",
+            status_code=500
+        )
 
 
 @upload_bp.route("/knowledge-base/upload-code-or-doc", methods=["POST"])
@@ -108,17 +121,17 @@ def upload_code_or_doc():
         500: Server processing error.
     """
     if "file" not in request.files:
-        return jsonify({"success": False, "error": "No file attached in upload"}), 400
+        return error_response(message="No file attached in upload", status_code=400)
 
     file = request.files["file"]
     if file.filename == "":
-        return jsonify({"success": False, "error": "No file selected"}), 400
+        return error_response(message="No file selected", status_code=400)
 
     if not CodeDocIngestionService.is_supported_file(file.filename):
-        return jsonify({
-            "success": False,
-            "error": "Unsupported file format. Supported: .py, .cs, .ts, .js, .jsx, .tsx, .java, .go, .cpp, .md, .txt"
-        }), 400
+        return error_response(
+            message="Unsupported file format. Supported: .py, .cs, .ts, .js, .jsx, .tsx, .java, .go, .cpp, .md, .txt",
+            status_code=400
+        )
 
     author_notes = request.form.get("notes", "").strip()
 
@@ -137,9 +150,21 @@ def upload_code_or_doc():
             author_notes=author_notes
         )
 
-        status_code = 200 if result.get("success") else 400
-        return jsonify(result), status_code
+        if result.get("success"):
+            return success_response(
+                message=result.get("message", "File extracted and staged successfully"),
+                status_code=200,
+                **result
+            )
+        return error_response(
+            message=result.get("error", "Code/doc ingestion failed"),
+            status_code=400,
+            **result
+        )
 
     except Exception as e:
         logger.exception(f"Error handling code/doc upload: {e}")
-        return jsonify({"success": False, "error": f"Upload processing error: {str(e)}"}), 500
+        return error_response(
+            message=f"Upload processing error: {str(e)}",
+            status_code=500
+        )

@@ -9,10 +9,11 @@ Provides operational monitoring and system diagnostic endpoints:
 
 import sys
 import logging
-from flask import Blueprint, jsonify
+from flask import Blueprint
 
 from app.config import Config
 from app.services.chroma_service import chroma_service
+from app.utils.response_helper import success_response
 
 admin_bp = Blueprint("admin", __name__)
 logger = logging.getLogger("DevKnow.AdminRoutes")
@@ -27,23 +28,17 @@ def health_check():
     application availability, active configurations, and connection counts.
 
     Responses:
-        200: JSON containing:
-            - status: 'healthy'
-            - app_name: Configured application name.
-            - environment: Deployment environment (e.g. 'development', 'production').
-            - db_provider: Active database backend ('mysql' or 'sqlite').
-            - gemini_model: Active generative AI model name.
-            - embedding_model: Active embedding model.
-            - vector_count: Total functions currently indexed in ChromaDB.
-            - python_version: Runtime Python version.
+        200: Standardized JSON response envelope containing health attributes.
     """
-    return jsonify({
-        "status": "healthy",
-        "app_name": Config.APP_NAME,
-        "environment": Config.APP_ENV,
-        "db_provider": Config.DB_PROVIDER,
-        "gemini_model": Config.GEMINI_MODEL,
-        "embedding_model": Config.EMBEDDING_MODEL,
-        "vector_count": chroma_service.get_count(),
-        "python_version": sys.version
-    })
+    return success_response(
+        message="DevKnow service is healthy and operational",
+        status_code=200,
+        status="healthy",  # Keep status='healthy' for existing monitoring tools
+        app_name=Config.APP_NAME,
+        environment=Config.APP_ENV,
+        db_provider=Config.DB_PROVIDER,
+        gemini_model=Config.GEMINI_MODEL,
+        embedding_model=Config.EMBEDDING_MODEL,
+        vector_count=chroma_service.get_count(),
+        python_version=sys.version
+    )
