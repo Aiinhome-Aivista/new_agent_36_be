@@ -89,7 +89,7 @@ def _log_ast_result(
         entry["extra"] = extra
 
     separator = "=" * 80
-    al.debug(
+    al.info(
         f"\n{separator}\n"
         f"PHASE        : {phase}\n"
         f"LANGUAGE     : {language}\n"
@@ -108,6 +108,25 @@ def _log_ast_result(
         f"FULL RESULT  : {json.dumps(result, default=str, indent=2)}\n"
         f"{separator}\n"
     )
+
+    # Also write standalone JSON file and print to terminal
+    try:
+        base_dir = Path(__file__).resolve().parent.parent.parent
+        ast_dir = base_dir / "data" / "logs" / "ast"
+        ast_dir.mkdir(parents=True, exist_ok=True)
+        latest_analysis_file = ast_dir / "ast_latest_analysis.json"
+        latest_analysis_file.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+
+        print(
+            f"🌳 [AST Inspection] {result.get('parser_engine', 'AST').upper()}: "
+            f"Parsed '{result.get('function_name', 'unnamed')}' | "
+            f"Complexity: {result.get('complexity', 1)} | "
+            f"Syntax: {'Valid' if result.get('is_valid_syntax') else 'Irregular'} | "
+            f"Params: {result.get('parameters', [])}",
+            flush=True
+        )
+    except Exception:
+        pass
 
 # Attempt lazy import of tree_sitter_languages
 _PARSERS: Dict[str, Any] = {}
@@ -521,13 +540,11 @@ class CodeParserService:
                             "complexity": complexity,
                             "language": "python"
                         })
-                if results:
-                    return results
             except Exception as pe:
                 logger.debug(f"Python full-file AST notice: {pe}")
 
-        # 2. Tree-sitter for C#, TypeScript, JavaScript, Python
-        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
+        # 2. Tree-sitter for C#, TypeScript, JavaScript (or Python fallback)
+        if not results and _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
             try:
                 parser = _PARSERS[norm_lang]
                 code_bytes = code.encode("utf-8")
@@ -590,28 +607,61 @@ class CodeParserService:
                         "language": norm_lang
                     })
 
-                if results:
-                    return results
             except Exception as ts_err:
                 logger.debug(f"Tree-sitter file extraction notice: {ts_err}")
 
-        # ── Log the full-file extraction result ────────────────────────────
+        # ── Always write log entry and generate standalone AST JSON file ──────────
         try:
             al = _get_ast_logger()
             sep = "=" * 80
-            al.debug(
+            summary_lines = [
+                f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
+                f"| complexity {r.get('complexity')} | params: {r.get('parameters')} | return: '{r.get('return_type', '')}'"
+                for i, r in enumerate(results)
+            ]
+            log_msg = (
                 f"\n{sep}\n"
-                f"PHASE        : extract_all_functions\n"
-                f"LANGUAGE     : {norm_lang}\n"
-                f"TOTAL FUNCTIONS FOUND: {len(results)}\n"
-                f"FUNCTION LIST:\n" +
-                "\n".join(
-                    f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
-                    f"| complexity {r.get('complexity')} | params {r.get('parameters')}"
-                    for i, r in enumerate(results)
-                ) +
+                f"PHASE                  : extract_all_functions\n"
+                f"LANGUAGE               : {norm_lang}\n"
+                f"TOTAL FUNCTIONS FOUND  : {len(results)}\n"
+                f"FUNCTIONS EXTRACTED:\n" +
+                ("\n".join(summary_lines) if summary_lines else "  None identified") +
                 f"\n{sep}\n"
             )
+            al.info(log_msg)
+
+            # Also print directly to terminal console so developer sees it in real time
+            print(f"\n{sep}", flush=True)
+            print(f"🌳 [AST Engine] Full File Extraction Complete ({norm_lang.upper()}):", flush=True)
+            print(f"• Total Functions Discovered: {len(results)}", flush=True)
+            for sl in summary_lines:
+                print(sl, flush=True)
+
+            # Generate standalone AST JSON file in data/logs/ast/
+            base_dir = Path(__file__).resolve().parent.parent.parent
+            ast_dir = base_dir / "data" / "logs" / "ast"
+            ast_dir.mkdir(parents=True, exist_ok=True)
+
+            ast_report = {
+                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "phase": "extract_all_functions",
+                "language": norm_lang,
+                "total_functions": len(results),
+                "functions": results
+            }
+
+            # 1. Always update latest file
+            latest_file = ast_dir / "ast_extracted_functions.json"
+            latest_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
+
+            # 2. Write timestamped audit file
+            ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            ts_file = ast_dir / f"ast_report_{ts_str}.json"
+            ts_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
+
+            print(f"📁 AST Report File Generated -> {latest_file}", flush=True)
+            print(f"{sep}\n", flush=True)
+
         except Exception as log_err:
             logger.debug(f"AST logger write error (non-critical): {log_err}")
 
