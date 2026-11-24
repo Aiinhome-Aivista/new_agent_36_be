@@ -346,12 +346,12 @@ class CodeDocIngestionService:
 
         logger.info(f"Staged {len(staged_items)} code snippet(s) from doc '{filename}' for human verification.")
 
-        # Generate dedicated AST JSON and Log for doc file
+        # Generate dedicated Tree-sitter JSON and Log for doc file
         try:
             import json
             base_dir = Path(__file__).resolve().parent.parent.parent
-            ast_dir = base_dir / "data" / "logs" / "ast"
-            ast_dir.mkdir(parents=True, exist_ok=True)
+            ts_dir = base_dir / "data" / "logs" / "treesitter"
+            ts_dir.mkdir(parents=True, exist_ok=True)
 
             clean_stem = re.sub(r'[^a-zA-Z0-9_-]', '_', Path(filename).stem)
             clean_ext = Path(filename).suffix.lstrip(".")
@@ -361,21 +361,23 @@ class CodeDocIngestionService:
             doc_report = {
                 "source_file": filename,
                 "file_type": "documentation",
+                "engine": "tree-sitter",
                 "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
                 "total_extracted": len(staged_items),
                 "staged_items": staged_items
             }
 
-            per_doc_json = ast_dir / f"ast_{file_tag}_{ts_str}.json"
+            per_doc_json = ts_dir / f"treesitter_{file_tag}_{ts_str}.json"
             per_doc_json.write_text(json.dumps(doc_report, indent=2), encoding="utf-8")
 
-            per_doc_log = ast_dir / f"ast_{file_tag}_{ts_str}.log"
+            per_doc_log = ts_dir / f"treesitter_{file_tag}_{ts_str}.log"
             sep = "=" * 80
             log_body = (
                 f"{sep}\n"
-                f"DOCUMENTATION AST EXTRACTION REPORT: {filename}\n"
-                f"TIMESTAMP                          : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"TOTAL CODE SNIPPETS / RULES FOUND  : {len(staged_items)}\n"
+                f"TREE-SITTER DOCUMENTATION EXTRACTION REPORT: {filename}\n"
+                f"TIMESTAMP                                  : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"PARSER ENGINE                              : Tree-sitter\n"
+                f"TOTAL CODE SNIPPETS / RULES FOUND          : {len(staged_items)}\n"
                 f"{sep}\n\n"
             )
             for idx, item in enumerate(staged_items):
@@ -389,14 +391,14 @@ class CodeDocIngestionService:
             per_doc_log.write_text(log_body, encoding="utf-8")
 
             print(f"\n{sep}", flush=True)
-            print(f"📖 [AST Engine] Documentation Ingestion Complete:", flush=True)
-            print(f"• Source File          : {filename}", flush=True)
-            print(f"• Total Snippets/Rules : {len(staged_items)}", flush=True)
-            print(f"📁 Dedicated AST Log   -> {per_doc_log.name}", flush=True)
-            print(f"📁 Dedicated AST JSON  -> {per_doc_json.name}", flush=True)
+            print(f"📖 [Tree-sitter Engine] Documentation Ingestion Complete:", flush=True)
+            print(f"• Source File               : {filename}", flush=True)
+            print(f"• Total Snippets/Rules      : {len(staged_items)}", flush=True)
+            print(f"📁 Dedicated Tree-sitter Log  -> {per_doc_log.name}", flush=True)
+            print(f"📁 Dedicated Tree-sitter JSON -> {per_doc_json.name}", flush=True)
             print(f"{sep}\n", flush=True)
         except Exception as e:
-            logger.debug(f"Doc AST logging notice: {e}")
+            logger.debug(f"Doc Tree-sitter logging notice: {e}")
 
         return {
             "success": True,

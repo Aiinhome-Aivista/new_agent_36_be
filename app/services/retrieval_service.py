@@ -185,7 +185,7 @@ class RetrievalService:
                 syntax_str = "Valid Syntax" if ast_info["is_valid_syntax"] else f"Irregular ({ast_info['syntax_error']})"
                 params_str = ", ".join(ast_info["parameters"]) if ast_info["parameters"] else "None identified"
                 ast_summary = (
-                    f"### STATIC AST CODE ANALYSIS (DETERMINISTIC COMPILER METRICS):\n"
+                    f"### STATIC TREE-SITTER CODE ANALYSIS (DETERMINISTIC COMPILER METRICS):\n"
                     f"- Language: {ast_info['language']}\n"
                     f"- Identified Function: {ast_info['function_name']}\n"
                     f"- Parameters: {params_str}\n"
@@ -362,7 +362,7 @@ class RetrievalService:
                 ast_metrics = code_parser.analyze_code_quality(code_to_inspect, inspect_lang)
                 engine_tag = ast_metrics["parser_engine"].replace("_", "-").upper()
                 thinking_steps.insert(-1, {
-                    "title": f"AST & Syntax Inspection ({engine_tag})",
+                    "title": f"Tree-sitter Syntax Inspection ({engine_tag})",
                     "detail": (
                         f"Parsed '{ast_metrics['function_name']}' | Complexity: {ast_metrics['complexity']} | "
                         f"Syntax: {'Valid' if ast_metrics['is_valid_syntax'] else 'Irregular'} | "

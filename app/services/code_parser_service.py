@@ -1,10 +1,9 @@
 """
-CodeParserService: AST and Tree-sitter Code Intelligence Engine for DevKnow.
+CodeParserService: Unified Tree-sitter AST Code Intelligence Engine for DevKnow.
 Provides deterministic syntax validation, function signature extraction,
 cyclomatic complexity calculation, and code quality smell detection across
 C#, TypeScript, JavaScript, and Python.
 """
-import ast
 import re
 import json
 import logging
@@ -20,30 +19,30 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 logger = logging.getLogger("DevKnow.CodeParser")
 
-# ── Dedicated AST Detail Logger (writes to data/logs/ast/ directory) ──────────
-_ast_detail_logger: Optional[logging.Logger] = None
+# ── Dedicated Tree-sitter Detail Logger (writes to data/logs/treesitter/ directory) ──────────
+_treesitter_detail_logger: Optional[logging.Logger] = None
 
-def _get_ast_logger() -> logging.Logger:
+def _get_treesitter_logger() -> logging.Logger:
     """
-    Returns the dedicated AST detail file logger, creating it on first call.
-    Writes to: new_agent_36_be/data/logs/ast/ast_analysis.log
+    Returns the dedicated Tree-sitter detail file logger, creating it on first call.
+    Writes to: new_agent_36_be/data/logs/treesitter/treesitter_analysis.log
     Uses RotatingFileHandler: 5MB per file, keeps last 5 files.
     """
-    global _ast_detail_logger
-    if _ast_detail_logger is not None:
-        return _ast_detail_logger
+    global _treesitter_detail_logger
+    if _treesitter_detail_logger is not None:
+        return _treesitter_detail_logger
 
-    # Build the path:  <backend_root>/data/logs/ast/
+    # Build the path:  <backend_root>/data/logs/treesitter/
     base_dir = Path(__file__).resolve().parent.parent.parent  # → new_agent_36_be/
-    ast_log_dir = base_dir / "data" / "logs" / "ast"
-    ast_log_dir.mkdir(parents=True, exist_ok=True)
+    ts_log_dir = base_dir / "data" / "logs" / "treesitter"
+    ts_log_dir.mkdir(parents=True, exist_ok=True)
 
-    _ast_detail_logger = logging.getLogger("DevKnow.AST.Detail")
-    _ast_detail_logger.setLevel(logging.DEBUG)
-    _ast_detail_logger.propagate = False   # Don't bubble up to root logger
+    _treesitter_detail_logger = logging.getLogger("DevKnow.TreeSitter.Detail")
+    _treesitter_detail_logger.setLevel(logging.DEBUG)
+    _treesitter_detail_logger.propagate = False   # Don't bubble up to root logger
 
-    if not _ast_detail_logger.handlers:
-        log_file = ast_log_dir / "ast_analysis.log"
+    if not _treesitter_detail_logger.handlers:
+        log_file = ts_log_dir / "treesitter_analysis.log"
         handler = RotatingFileHandler(
             str(log_file),
             maxBytes=5 * 1024 * 1024,   # 5 MB per file
@@ -54,13 +53,13 @@ def _get_ast_logger() -> logging.Logger:
             "[%(asctime)s] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S"
         ))
-        _ast_detail_logger.addHandler(handler)
-        logger.info(f"AST detail logger initialized → {log_file}")
+        _treesitter_detail_logger.addHandler(handler)
+        logger.info(f"Tree-sitter detail logger initialized → {log_file}")
 
-    return _ast_detail_logger
+    return _treesitter_detail_logger
 
 
-def _log_ast_result(
+def _log_treesitter_result(
     phase: str,
     code_snippet: str,
     language: str,
@@ -68,10 +67,10 @@ def _log_ast_result(
     extra: Optional[Dict[str, Any]] = None
 ) -> None:
     """
-    Writes a full structured log entry to the AST log file.
+    Writes a full structured log entry to the Tree-sitter log file.
     Called after every parse_function_metadata / analyze_code_quality run.
     """
-    al = _get_ast_logger()
+    tl = _get_treesitter_logger()
     # Truncate code for readability (first 20 lines max)
     code_lines = code_snippet.strip().splitlines()
     code_preview = "\n".join(code_lines[:20])
@@ -89,11 +88,11 @@ def _log_ast_result(
         entry["extra"] = extra
 
     separator = "=" * 80
-    al.info(
+    tl.info(
         f"\n{separator}\n"
         f"PHASE        : {phase}\n"
         f"LANGUAGE     : {language}\n"
-        f"PARSER USED  : {result.get('parser_engine', result.get('parser_used', 'N/A'))}\n"
+        f"PARSER USED  : {result.get('parser_engine', result.get('parser_used', 'tree-sitter'))}\n"
         f"FUNCTION     : {result.get('function_name', 'N/A')}\n"
         f"PARAMETERS   : {result.get('parameters', [])}\n"
         f"RETURN TYPE  : {result.get('return_type', 'N/A')}\n"
@@ -112,13 +111,13 @@ def _log_ast_result(
     # Also write standalone JSON file and print to terminal
     try:
         base_dir = Path(__file__).resolve().parent.parent.parent
-        ast_dir = base_dir / "data" / "logs" / "ast"
-        ast_dir.mkdir(parents=True, exist_ok=True)
-        latest_analysis_file = ast_dir / "ast_latest_analysis.json"
+        ts_dir = base_dir / "data" / "logs" / "treesitter"
+        ts_dir.mkdir(parents=True, exist_ok=True)
+        latest_analysis_file = ts_dir / "treesitter_latest_analysis.json"
         latest_analysis_file.write_text(json.dumps(entry, indent=2), encoding="utf-8")
 
         print(
-            f"🌳 [AST Inspection] {result.get('parser_engine', 'AST').upper()}: "
+            f"🌳 [Tree-sitter Inspection] "
             f"Parsed '{result.get('function_name', 'unnamed')}' | "
             f"Complexity: {result.get('complexity', 1)} | "
             f"Syntax: {'Valid' if result.get('is_valid_syntax') else 'Irregular'} | "
@@ -171,7 +170,7 @@ class CodeParserService:
     def parse_function_metadata(cls, code: str, language: Optional[str] = None) -> Dict[str, Any]:
         """
         Extracts function name, parameters, return type, and async status
-        using Tree-sitter or Python AST, with graceful regex fallback.
+        using Tree-sitter AST parser, with graceful regex fallback.
         """
         if not code or not code.strip():
             return {
@@ -185,42 +184,14 @@ class CodeParserService:
 
         norm_lang = cls.normalize_language(language)
 
-        # 1. Native Python AST for Python code
-        if norm_lang == "python":
-            py_meta = cls._parse_python_ast(code)
-            if py_meta and py_meta.get("function_name"):
-                return py_meta
-
-        # 2. Tree-sitter for C#, TypeScript, JavaScript, Python
+        # 1. Tree-sitter for all supported languages (C#, TypeScript, JavaScript, Python)
         if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
             ts_meta = cls._parse_tree_sitter(code, norm_lang)
             if ts_meta and ts_meta.get("function_name"):
                 return ts_meta
 
-        # 3. Fallback to Regex
+        # 2. Fallback to Regex
         return cls._fallback_regex_parse(code, norm_lang)
-
-    @classmethod
-    def _parse_python_ast(cls, code: str) -> Optional[Dict[str, Any]]:
-        """Parses Python code using the standard library ast module"""
-        try:
-            tree = ast.parse(code)
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    params = [a.arg for a in node.args.args if a.arg != "self"]
-                    ret_type = ast.unparse(node.returns) if node.returns else ""
-                    complexity = cls._calculate_python_complexity(node)
-                    return {
-                        "function_name": node.name,
-                        "parameters": params,
-                        "return_type": ret_type,
-                        "is_async": isinstance(node, ast.AsyncFunctionDef),
-                        "complexity": complexity,
-                        "parser_used": "python-ast"
-                    }
-        except SyntaxError:
-            pass
-        return None
 
     @classmethod
     def _parse_tree_sitter(cls, code: str, norm_lang: str) -> Optional[Dict[str, Any]]:
@@ -264,13 +235,15 @@ class CodeParserService:
             find_func_node(root)
 
             if not target_node:
-                # If wrapped in export_statement
+                # If wrapped in export_statement or decorated_definition
                 for child in root.children:
-                    if child.type == "export_statement":
-                        decl = child.child_by_field_name("declaration")
-                        if decl:
-                            target_node = decl
-                            break
+                    if child.type in ("export_statement", "decorated_definition"):
+                        for sub in child.children:
+                            if sub.type in ("function_definition", "method_declaration", "function_declaration"):
+                                target_node = sub
+                                break
+                    if target_node:
+                        break
 
             if target_node:
                 # Name
@@ -287,9 +260,9 @@ class CodeParserService:
                 params_node = target_node.child_by_field_name("parameters")
                 if params_node:
                     for p in params_node.children:
-                        if p.type in ("parameter", "identifier", "required_parameter", "optional_parameter"):
+                        if p.type not in (",", "(", ")"):
                             p_text = p.text.decode("utf-8").strip()
-                            if p_text and p_text not in (",", "(", ")"):
+                            if p_text and p_text not in (",", "(", ")") and p_text != "self":
                                 params.append(p_text)
 
                 # Async check
@@ -345,7 +318,7 @@ class CodeParserService:
     @classmethod
     def validate_syntax(cls, code: str, language: Optional[str] = None) -> Dict[str, Any]:
         """
-        Validates whether code snippet has syntax errors.
+        Validates whether code snippet has syntax errors using Tree-sitter.
         Returns: { "is_valid": bool, "error_message": str or None }
         """
         if not code or not code.strip():
@@ -353,18 +326,7 @@ class CodeParserService:
 
         norm_lang = cls.normalize_language(language)
 
-        # 1. Python AST validation
-        if norm_lang == "python":
-            try:
-                ast.parse(code)
-                return {"is_valid": True, "error_message": None}
-            except SyntaxError as se:
-                return {
-                    "is_valid": False,
-                    "error_message": f"SyntaxError at line {se.lineno}: {se.msg}"
-                }
-
-        # 2. Tree-sitter error node validation
+        # Tree-sitter error node validation across all supported languages
         if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
             try:
                 parser = _PARSERS[norm_lang]
@@ -397,34 +359,22 @@ class CodeParserService:
         return {"is_valid": True, "error_message": None}
 
     @classmethod
-    def _calculate_python_complexity(cls, func_node) -> int:
-        """Calculates McCabe Cyclomatic Complexity for Python AST"""
-        complexity = 1
-        for node in ast.walk(func_node):
-            if isinstance(node, (ast.If, ast.While, ast.For, ast.AsyncFor, ast.ExceptHandler, ast.With, ast.Assert)):
-                complexity += 1
-            elif isinstance(node, ast.BoolOp):
-                complexity += len(node.values) - 1
-            elif isinstance(node, ast.IfExp):
-                complexity += 1
-        return complexity
-
-    @classmethod
     def _calculate_tree_sitter_complexity(cls, func_node) -> int:
         """Calculates Cyclomatic Complexity by traversing Tree-sitter branching nodes"""
         branch_types = {
-            "if_statement", "while_statement", "for_statement", "for_in_statement",
-            "catch_clause", "switch_case", "conditional_expression", "binary_expression"
+            "if_statement", "elif_clause", "while_statement", "for_statement", "for_in_statement",
+            "catch_clause", "except_clause", "switch_case", "conditional_expression",
+            "binary_expression", "boolean_operator"
         }
         complexity = 1
 
         def count_branches(n):
             nonlocal complexity
             if n.type in branch_types:
-                if n.type == "binary_expression":
-                    # Only logical && and ||
+                if n.type in ("binary_expression", "boolean_operator"):
                     op = n.child_by_field_name("operator")
-                    if op and op.text.decode("utf-8") in ("&&", "||", "and", "or"):
+                    op_text = op.text.decode("utf-8") if op else n.text.decode("utf-8")
+                    if any(tok in op_text for tok in ("&&", "||", "and", "or")):
                         complexity += 1
                 else:
                     complexity += 1
@@ -439,7 +389,7 @@ class CodeParserService:
         """
         Runs comprehensive deterministic code quality, complexity,
         and defensive programming inspection.
-        Writes a full structured report to data/logs/ast/ast_analysis.log.
+        Writes a full structured report to data/logs/treesitter/treesitter_analysis.log.
         """
         norm_lang = cls.normalize_language(language)
         meta = cls.parse_function_metadata(code, norm_lang)
@@ -480,9 +430,9 @@ class CodeParserService:
             "is_async": meta.get("is_async", False),
         }
 
-        # ── Write full AST analysis to dedicated log file ──────────────────
+        # ── Write full Tree-sitter analysis to dedicated log file ──────────────────
         try:
-            _log_ast_result(
+            _log_treesitter_result(
                 phase="analyze_code_quality",
                 code_snippet=code,
                 language=norm_lang,
@@ -496,7 +446,7 @@ class CodeParserService:
                 }
             )
         except Exception as log_err:
-            logger.debug(f"AST logger write error (non-critical): {log_err}")
+            logger.debug(f"Tree-sitter logger write error (non-critical): {log_err}")
 
         return result
 
@@ -517,39 +467,8 @@ class CodeParserService:
         norm_lang = cls.normalize_language(language)
         results = []
 
-        # 1. Native Python AST for Python files
-        if norm_lang == "python":
-            try:
-                tree = ast.parse(code)
-                lines = code.split("\n")
-                for node in ast.walk(tree):
-                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        start_line = node.lineno
-                        end_line = getattr(node, "end_lineno", node.lineno)
-                        fn_lines = lines[start_line - 1 : end_line]
-                        fn_full = "\n".join(fn_lines)
-                        header = lines[start_line - 1].strip()
-                        body = "\n".join(lines[start_line : end_line])
-                        params = [a.arg for a in node.args.args if a.arg != "self"]
-                        ret_type = ast.unparse(node.returns) if node.returns else ""
-                        complexity = cls._calculate_python_complexity(node)
-                        results.append({
-                            "function_name": node.name,
-                            "function_header": header,
-                            "function_body": body,
-                            "full_code": fn_full,
-                            "parameters": params,
-                            "return_type": ret_type,
-                            "start_line": start_line,
-                            "end_line": end_line,
-                            "complexity": complexity,
-                            "language": "python"
-                        })
-            except Exception as pe:
-                logger.debug(f"Python full-file AST notice: {pe}")
-
-        # 2. Tree-sitter for C#, TypeScript, JavaScript (or Python fallback)
-        if not results and _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
+        # Tree-sitter file extraction across all supported languages (C#, TypeScript, JavaScript, Python)
+        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
             try:
                 parser = _PARSERS[norm_lang]
                 code_bytes = code.encode("utf-8")
@@ -586,12 +505,17 @@ class CodeParserService:
                     params_node = node.child_by_field_name("parameters")
                     if params_node:
                         for p in params_node.children:
-                            if p.type in ("parameter", "identifier", "required_parameter", "optional_parameter"):
+                            if p.type not in (",", "(", ")"):
                                 p_text = p.text.decode("utf-8").strip()
-                                if p_text and p_text not in (",", "(", ")"):
+                                if p_text and p_text not in (",", "(", ")") and p_text != "self":
                                     params.append(p_text)
 
-                    start_line = node.start_point[0] + 1
+                    # If decorated (e.g. @contextmanager in Python), include decorator in lines
+                    start_node = node
+                    if node.parent and node.parent.type == "decorated_definition":
+                        start_node = node.parent
+
+                    start_line = start_node.start_point[0] + 1
                     end_line = node.end_point[0] + 1
                     fn_lines = lines[start_line - 1 : end_line]
                     fn_full = "\n".join(fn_lines)
@@ -615,9 +539,9 @@ class CodeParserService:
             except Exception as ts_err:
                 logger.debug(f"Tree-sitter file extraction notice: {ts_err}")
 
-        # ── Always write log entry and generate standalone AST JSON & Log files ──────────
+        # ── Always write log entry and generate standalone Tree-sitter JSON & Log files ──────────
         try:
-            al = _get_ast_logger()
+            tl = _get_treesitter_logger()
             sep = "=" * 80
             summary_lines = [
                 f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
@@ -634,12 +558,12 @@ class CodeParserService:
                 ("\n".join(summary_lines) if summary_lines else "  None identified") +
                 f"\n{sep}\n"
             )
-            al.info(log_msg)
+            tl.info(log_msg)
 
-            # Generate standalone AST files in data/logs/ast/
+            # Generate standalone Tree-sitter files in data/logs/treesitter/
             base_dir = Path(__file__).resolve().parent.parent.parent
-            ast_dir = base_dir / "data" / "logs" / "ast"
-            ast_dir.mkdir(parents=True, exist_ok=True)
+            ts_dir = base_dir / "data" / "logs" / "treesitter"
+            ts_dir.mkdir(parents=True, exist_ok=True)
 
             # Clean filename tag (e.g. database.py -> database_py)
             if source_filename:
@@ -651,27 +575,29 @@ class CodeParserService:
 
             ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
-            ast_report = {
+            report = {
                 "source_file": source_filename or "direct_input",
                 "generated_at": datetime.utcnow().isoformat() + "Z",
                 "phase": "extract_all_functions",
+                "engine": "tree-sitter",
                 "language": norm_lang,
                 "total_functions": len(results),
                 "functions": results
             }
 
-            # 1. Dedicated per-file JSON file: e.g. ast_database_py_20261124_124500.json
-            per_file_json = ast_dir / f"ast_{file_tag}_{ts_str}.json"
-            per_file_json.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
+            # 1. Dedicated per-file JSON file: e.g. treesitter_database_py_20261124_142000.json
+            per_file_json = ts_dir / f"treesitter_{file_tag}_{ts_str}.json"
+            per_file_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # 2. Dedicated per-file human-readable LOG file: e.g. ast_database_py_20261124_124500.log
-            per_file_log = ast_dir / f"ast_{file_tag}_{ts_str}.log"
+            # 2. Dedicated per-file human-readable LOG file: e.g. treesitter_database_py_20261124_142000.log
+            per_file_log = ts_dir / f"treesitter_{file_tag}_{ts_str}.log"
             log_body = (
                 f"{sep}\n"
-                f"AST EXTRACTION REPORT FOR: {source_filename or 'Direct Code Input'}\n"
-                f"TIMESTAMP                : {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-                f"LANGUAGE                 : {norm_lang.upper()}\n"
-                f"TOTAL FUNCTIONS DISCOVERED: {len(results)}\n"
+                f"TREE-SITTER EXTRACTION REPORT FOR: {source_filename or 'Direct Code Input'}\n"
+                f"TIMESTAMP                        : {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"PARSER ENGINE                    : Tree-sitter\n"
+                f"LANGUAGE                         : {norm_lang.upper()}\n"
+                f"TOTAL FUNCTIONS DISCOVERED       : {len(results)}\n"
                 f"{sep}\n\n"
                 f"FUNCTION SIGNATURES SUMMARY:\n"
                 + ("\n".join(summary_lines) if summary_lines else "  No functions discovered.")
@@ -691,24 +617,24 @@ class CodeParserService:
             per_file_log.write_text(log_body, encoding="utf-8")
 
             # 3. Always update latest file pointer
-            latest_file = ast_dir / "ast_extracted_functions.json"
-            latest_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
+            latest_file = ts_dir / "treesitter_extracted_functions.json"
+            latest_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
             # Also print directly to terminal console so developer sees it in real time
             print(f"\n{sep}", flush=True)
-            print(f"🌳 [AST Engine] Full File Extraction Complete:", flush=True)
+            print(f"🌳 [Tree-sitter Engine] Full File Extraction Complete:", flush=True)
             print(f"• Source File               : {source_filename or 'Direct Input'}", flush=True)
             print(f"• Language                  : {norm_lang.upper()}", flush=True)
             print(f"• Total Functions Discovered: {len(results)}", flush=True)
             for sl in summary_lines:
                 print(sl, flush=True)
-            print(f"📁 Dedicated AST Log File   -> {per_file_log.name}", flush=True)
-            print(f"📁 Dedicated AST JSON File  -> {per_file_json.name}", flush=True)
-            print(f"📁 Latest Pointer File      -> ast_extracted_functions.json", flush=True)
+            print(f"📁 Dedicated Tree-sitter Log File  -> {per_file_log.name}", flush=True)
+            print(f"📁 Dedicated Tree-sitter JSON File -> {per_file_json.name}", flush=True)
+            print(f"📁 Latest Pointer File             -> treesitter_extracted_functions.json", flush=True)
             print(f"{sep}\n", flush=True)
 
         except Exception as log_err:
-            logger.debug(f"AST logger write error (non-critical): {log_err}")
+            logger.debug(f"Tree-sitter logger write error (non-critical): {log_err}")
 
         return results
 
