@@ -501,7 +501,12 @@ class CodeParserService:
         return result
 
     @classmethod
-    def extract_all_functions(cls, code: str, language: Optional[str] = None) -> List[Dict[str, Any]]:
+    def extract_all_functions(
+        cls,
+        code: str,
+        language: Optional[str] = None,
+        source_filename: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Parses an entire source code file (e.g. .cs, .ts, .js, .py)
         and extracts every function/method as a distinct, atomic chunk.
@@ -610,7 +615,7 @@ class CodeParserService:
             except Exception as ts_err:
                 logger.debug(f"Tree-sitter file extraction notice: {ts_err}")
 
-        # ── Always write log entry and generate standalone AST JSON file ──────────
+        # ── Always write log entry and generate standalone AST JSON & Log files ──────────
         try:
             al = _get_ast_logger()
             sep = "=" * 80
@@ -621,6 +626,7 @@ class CodeParserService:
             ]
             log_msg = (
                 f"\n{sep}\n"
+                f"FILE                   : {source_filename or 'Direct Snippet'}\n"
                 f"PHASE                  : extract_all_functions\n"
                 f"LANGUAGE               : {norm_lang}\n"
                 f"TOTAL FUNCTIONS FOUND  : {len(results)}\n"
@@ -630,19 +636,23 @@ class CodeParserService:
             )
             al.info(log_msg)
 
-            # Also print directly to terminal console so developer sees it in real time
-            print(f"\n{sep}", flush=True)
-            print(f"🌳 [AST Engine] Full File Extraction Complete ({norm_lang.upper()}):", flush=True)
-            print(f"• Total Functions Discovered: {len(results)}", flush=True)
-            for sl in summary_lines:
-                print(sl, flush=True)
-
-            # Generate standalone AST JSON file in data/logs/ast/
+            # Generate standalone AST files in data/logs/ast/
             base_dir = Path(__file__).resolve().parent.parent.parent
             ast_dir = base_dir / "data" / "logs" / "ast"
             ast_dir.mkdir(parents=True, exist_ok=True)
 
+            # Clean filename tag (e.g. database.py -> database_py)
+            if source_filename:
+                clean_stem = re.sub(r'[^a-zA-Z0-9_-]', '_', Path(source_filename).stem)
+                clean_ext = Path(source_filename).suffix.lstrip(".")
+                file_tag = f"{clean_stem}_{clean_ext}" if clean_ext else clean_stem
+            else:
+                file_tag = norm_lang
+
+            ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
             ast_report = {
+                "source_file": source_filename or "direct_input",
                 "generated_at": datetime.utcnow().isoformat() + "Z",
                 "phase": "extract_all_functions",
                 "language": norm_lang,
@@ -650,16 +660,51 @@ class CodeParserService:
                 "functions": results
             }
 
-            # 1. Always update latest file
+            # 1. Dedicated per-file JSON file: e.g. ast_database_py_20261124_124500.json
+            per_file_json = ast_dir / f"ast_{file_tag}_{ts_str}.json"
+            per_file_json.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
+
+            # 2. Dedicated per-file human-readable LOG file: e.g. ast_database_py_20261124_124500.log
+            per_file_log = ast_dir / f"ast_{file_tag}_{ts_str}.log"
+            log_body = (
+                f"{sep}\n"
+                f"AST EXTRACTION REPORT FOR: {source_filename or 'Direct Code Input'}\n"
+                f"TIMESTAMP                : {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"LANGUAGE                 : {norm_lang.upper()}\n"
+                f"TOTAL FUNCTIONS DISCOVERED: {len(results)}\n"
+                f"{sep}\n\n"
+                f"FUNCTION SIGNATURES SUMMARY:\n"
+                + ("\n".join(summary_lines) if summary_lines else "  No functions discovered.")
+                + f"\n\n{sep}\n"
+                f"DETAILED FUNCTION BODIES:\n"
+                f"{sep}\n"
+            )
+            for i, r in enumerate(results):
+                log_body += (
+                    f"\n--- [Function {i+1}]: {r['function_name']} (lines {r.get('start_line')}-{r.get('end_line')}) ---\n"
+                    f"Complexity : {r.get('complexity', 1)}\n"
+                    f"Parameters : {r.get('parameters', [])}\n"
+                    f"Return Type: {r.get('return_type', 'unspecified')}\n"
+                    f"Header     : {r.get('function_header', '')}\n"
+                    f"Full Code  :\n{r.get('full_code', '')}\n"
+                )
+            per_file_log.write_text(log_body, encoding="utf-8")
+
+            # 3. Always update latest file pointer
             latest_file = ast_dir / "ast_extracted_functions.json"
             latest_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
 
-            # 2. Write timestamped audit file
-            ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            ts_file = ast_dir / f"ast_report_{ts_str}.json"
-            ts_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
-
-            print(f"📁 AST Report File Generated -> {latest_file}", flush=True)
+            # Also print directly to terminal console so developer sees it in real time
+            print(f"\n{sep}", flush=True)
+            print(f"🌳 [AST Engine] Full File Extraction Complete:", flush=True)
+            print(f"• Source File               : {source_filename or 'Direct Input'}", flush=True)
+            print(f"• Language                  : {norm_lang.upper()}", flush=True)
+            print(f"• Total Functions Discovered: {len(results)}", flush=True)
+            for sl in summary_lines:
+                print(sl, flush=True)
+            print(f"📁 Dedicated AST Log File   -> {per_file_log.name}", flush=True)
+            print(f"📁 Dedicated AST JSON File  -> {per_file_json.name}", flush=True)
+            print(f"📁 Latest Pointer File      -> ast_extracted_functions.json", flush=True)
             print(f"{sep}\n", flush=True)
 
         except Exception as log_err:

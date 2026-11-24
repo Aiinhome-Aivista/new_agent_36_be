@@ -118,7 +118,7 @@ class CodeDocIngestionService:
         author_notes: Optional[str] = None
     ) -> Dict[str, Any]:
         """Extracts all functions via AST, checks conflicts, and saves to Staging Queue"""
-        extracted = code_parser.extract_all_functions(code_content, language)
+        extracted = code_parser.extract_all_functions(code_content, language, source_filename=filename)
 
         if not extracted:
             # Fall back to single function parsing if whole file extraction didn't yield blocks
@@ -345,6 +345,58 @@ class CodeDocIngestionService:
                 kb_f.ingestion_status = "staged_for_review"
 
         logger.info(f"Staged {len(staged_items)} code snippet(s) from doc '{filename}' for human verification.")
+
+        # Generate dedicated AST JSON and Log for doc file
+        try:
+            import json
+            base_dir = Path(__file__).resolve().parent.parent.parent
+            ast_dir = base_dir / "data" / "logs" / "ast"
+            ast_dir.mkdir(parents=True, exist_ok=True)
+
+            clean_stem = re.sub(r'[^a-zA-Z0-9_-]', '_', Path(filename).stem)
+            clean_ext = Path(filename).suffix.lstrip(".")
+            file_tag = f"{clean_stem}_{clean_ext}" if clean_ext else clean_stem
+            ts_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+            doc_report = {
+                "source_file": filename,
+                "file_type": "documentation",
+                "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "total_extracted": len(staged_items),
+                "staged_items": staged_items
+            }
+
+            per_doc_json = ast_dir / f"ast_{file_tag}_{ts_str}.json"
+            per_doc_json.write_text(json.dumps(doc_report, indent=2), encoding="utf-8")
+
+            per_doc_log = ast_dir / f"ast_{file_tag}_{ts_str}.log"
+            sep = "=" * 80
+            log_body = (
+                f"{sep}\n"
+                f"DOCUMENTATION AST EXTRACTION REPORT: {filename}\n"
+                f"TIMESTAMP                          : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"TOTAL CODE SNIPPETS / RULES FOUND  : {len(staged_items)}\n"
+                f"{sep}\n\n"
+            )
+            for idx, item in enumerate(staged_items):
+                log_body += (
+                    f"[{idx+1}] Function/Rule: {item['function_name']}\n"
+                    f"    Language     : {item['language']}\n"
+                    f"    Version      : {item['version']}\n"
+                    f"    Status       : {item['conflict_status']}\n"
+                    f"    Description  : {item['description']}\n\n"
+                )
+            per_doc_log.write_text(log_body, encoding="utf-8")
+
+            print(f"\n{sep}", flush=True)
+            print(f"📖 [AST Engine] Documentation Ingestion Complete:", flush=True)
+            print(f"• Source File          : {filename}", flush=True)
+            print(f"• Total Snippets/Rules : {len(staged_items)}", flush=True)
+            print(f"📁 Dedicated AST Log   -> {per_doc_log.name}", flush=True)
+            print(f"📁 Dedicated AST JSON  -> {per_doc_json.name}", flush=True)
+            print(f"{sep}\n", flush=True)
+        except Exception as e:
+            logger.debug(f"Doc AST logging notice: {e}")
 
         return {
             "success": True,
