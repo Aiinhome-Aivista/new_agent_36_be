@@ -108,7 +108,11 @@ class RetrievalService:
             if has_potential_match:
                 mysql_ids = [m["mysql_id"] for m in vector_matches if m.get("mysql_id")]
                 with db_service.get_session() as session:
-                    records = session.query(FunctionRecord).filter(FunctionRecord.id.in_(mysql_ids)).all()
+                    # STRICT GUARD: Only retrieve functions that have been human-verified!
+                    records = session.query(FunctionRecord).filter(
+                        FunctionRecord.id.in_(mysql_ids),
+                        (FunctionRecord.verification_status == "verified") | (FunctionRecord.verification_status.is_(None))
+                    ).all()
                     record_map = {r.id: r for r in records}
 
                     for vm in vector_matches:

@@ -54,7 +54,10 @@ class FunctionRecord(Base):
     namespace = Column(String(255), index=True, default="")
     description = Column(Text, default="")
     additional_metadata = Column(Text, default="")
-    knowledge_source = Column(String(50), default="excel", index=True)  # 'excel' or 'llm_generated'
+    knowledge_source = Column(String(50), default="excel", index=True)  # 'excel', 'code_file', 'doc_file', or 'llm_generated'
+    verification_status = Column(String(50), default="verified", index=True)  # 'verified', 'pending_review', 'rejected'
+    conflict_status = Column(String(50), default="clean")  # 'clean', 'conflict_detected', 'version_increment'
+    parent_function_id = Column(Integer, nullable=True)
     source_file_id = Column(Integer, ForeignKey("knowledge_base_files.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
@@ -78,6 +81,9 @@ class FunctionRecord(Base):
             "description": self.description,
             "additional_metadata": self.additional_metadata,
             "knowledge_source": self.knowledge_source,
+            "verification_status": self.verification_status or "verified",
+            "conflict_status": self.conflict_status or "clean",
+            "parent_function_id": self.parent_function_id,
             "source_file_id": self.source_file_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None

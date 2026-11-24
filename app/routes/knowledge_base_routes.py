@@ -146,3 +146,59 @@ def delete_llm_generated(func_id):
         return jsonify({"success": True, "message": f"Record {func_id} removed from KB."})
     return jsonify({"success": False, "error": "Record not found or not LLM-generated"}), 404
 
+
+# ── Human-in-the-Loop Review Queue Endpoints ─────────────────────────────────
+
+@kb_bp.route("/knowledge-base/staging-queue", methods=["GET"])
+def get_staging_queue():
+    """
+    Returns all functions waiting in the staging queue for human review.
+    Status defaults to 'pending_review'.
+    """
+    from app.services.code_doc_ingestion_service import CodeDocIngestionService
+    status = request.args.get("status", "pending_review")
+    items = CodeDocIngestionService.list_staging_queue(status=status)
+    return jsonify({
+        "success": True,
+        "count": len(items),
+        "items": items
+    }), 200
+
+
+@kb_bp.route("/knowledge-base/staging-queue/<int:func_id>/approve", methods=["POST"])
+def approve_staged_function(func_id):
+    """
+    Human verification action: Approves a function in the staging queue.
+    Updates verification_status to 'verified' and indexes into ChromaDB.
+    """
+    from app.services.code_doc_ingestion_service import CodeDocIngestionService
+    data = request.get_json() or {}
+    approved_version = data.get("version")
+    notes = data.get("notes")
+
+    res = CodeDocIngestionService.approve_staged_function(
+        function_id=func_id,
+        approved_version=approved_version,
+        notes=notes
+    )
+    status_code = 200 if res.get("success") else 400
+    return jsonify(res), status_code
+
+
+@kb_bp.route("/knowledge-base/staging-queue/<int:func_id>/reject", methods=["POST"])
+def reject_staged_function(func_id):
+    """
+    Human verification action: Rejects a function in the staging queue.
+    Excludes it from the Knowledge Base and vector index.
+    """
+    from app.services.code_doc_ingestion_service import CodeDocIngestionService
+    data = request.get_json() or {}
+    reason = data.get("reason", "Rejected during human review")
+
+    res = CodeDocIngestionService.reject_staged_function(
+        function_id=func_id,
+        reason=reason
+    )
+    status_code = 200 if res.get("success") else 400
+    return jsonify(res), status_code
+

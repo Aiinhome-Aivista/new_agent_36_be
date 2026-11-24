@@ -6,14 +6,108 @@ C#, TypeScript, JavaScript, and Python.
 """
 import ast
 import re
+import json
 import logging
 import warnings
+import textwrap
+from pathlib import Path
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Dict, Any, List, Optional
 
 # Suppress deprecation warnings from C-extensions / tree_sitter legacy bindings
 warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 logger = logging.getLogger("DevKnow.CodeParser")
+
+# ── Dedicated AST Detail Logger (writes to data/logs/ast/ directory) ──────────
+_ast_detail_logger: Optional[logging.Logger] = None
+
+def _get_ast_logger() -> logging.Logger:
+    """
+    Returns the dedicated AST detail file logger, creating it on first call.
+    Writes to: new_agent_36_be/data/logs/ast/ast_analysis.log
+    Uses RotatingFileHandler: 5MB per file, keeps last 5 files.
+    """
+    global _ast_detail_logger
+    if _ast_detail_logger is not None:
+        return _ast_detail_logger
+
+    # Build the path:  <backend_root>/data/logs/ast/
+    base_dir = Path(__file__).resolve().parent.parent.parent  # → new_agent_36_be/
+    ast_log_dir = base_dir / "data" / "logs" / "ast"
+    ast_log_dir.mkdir(parents=True, exist_ok=True)
+
+    _ast_detail_logger = logging.getLogger("DevKnow.AST.Detail")
+    _ast_detail_logger.setLevel(logging.DEBUG)
+    _ast_detail_logger.propagate = False   # Don't bubble up to root logger
+
+    if not _ast_detail_logger.handlers:
+        log_file = ast_log_dir / "ast_analysis.log"
+        handler = RotatingFileHandler(
+            str(log_file),
+            maxBytes=5 * 1024 * 1024,   # 5 MB per file
+            backupCount=5,
+            encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        ))
+        _ast_detail_logger.addHandler(handler)
+        logger.info(f"AST detail logger initialized → {log_file}")
+
+    return _ast_detail_logger
+
+
+def _log_ast_result(
+    phase: str,
+    code_snippet: str,
+    language: str,
+    result: Dict[str, Any],
+    extra: Optional[Dict[str, Any]] = None
+) -> None:
+    """
+    Writes a full structured log entry to the AST log file.
+    Called after every parse_function_metadata / analyze_code_quality run.
+    """
+    al = _get_ast_logger()
+    # Truncate code for readability (first 20 lines max)
+    code_lines = code_snippet.strip().splitlines()
+    code_preview = "\n".join(code_lines[:20])
+    if len(code_lines) > 20:
+        code_preview += f"\n... [{len(code_lines) - 20} more lines truncated]"
+
+    entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "phase": phase,
+        "language_input": language,
+        "code_preview": code_preview,
+        "result": result,
+    }
+    if extra:
+        entry["extra"] = extra
+
+    separator = "=" * 80
+    al.debug(
+        f"\n{separator}\n"
+        f"PHASE        : {phase}\n"
+        f"LANGUAGE     : {language}\n"
+        f"PARSER USED  : {result.get('parser_engine', result.get('parser_used', 'N/A'))}\n"
+        f"FUNCTION     : {result.get('function_name', 'N/A')}\n"
+        f"PARAMETERS   : {result.get('parameters', [])}\n"
+        f"RETURN TYPE  : {result.get('return_type', 'N/A')}\n"
+        f"COMPLEXITY   : {result.get('complexity', 'N/A')}\n"
+        f"LINES OF CODE: {result.get('lines_of_code', 'N/A')}\n"
+        f"SYNTAX VALID : {result.get('is_valid_syntax', 'N/A')}\n"
+        f"SYNTAX ERROR : {result.get('syntax_error', 'None')}\n"
+        f"CODE SMELLS  : {result.get('code_smells', [])}\n"
+        f"IS ASYNC     : {result.get('is_async', 'N/A')}\n"
+        f"EXTRA        : {json.dumps(extra, default=str) if extra else 'None'}\n"
+        f"CODE PREVIEW :\n{textwrap.indent(code_preview, '  ')}\n"
+        f"FULL RESULT  : {json.dumps(result, default=str, indent=2)}\n"
+        f"{separator}\n"
+    )
 
 # Attempt lazy import of tree_sitter_languages
 _PARSERS: Dict[str, Any] = {}
@@ -326,6 +420,7 @@ class CodeParserService:
         """
         Runs comprehensive deterministic code quality, complexity,
         and defensive programming inspection.
+        Writes a full structured report to data/logs/ast/ast_analysis.log.
         """
         norm_lang = cls.normalize_language(language)
         meta = cls.parse_function_metadata(code, norm_lang)
@@ -352,7 +447,7 @@ class CodeParserService:
                     smells.append(f"Parameter '{p_name}' accessed via dot-notation without apparent null-check guard.")
                     break
 
-        return {
+        result = {
             "function_name": meta.get("function_name", "unnamed"),
             "language": norm_lang,
             "parameters": meta.get("parameters", []),
@@ -362,8 +457,29 @@ class CodeParserService:
             "is_valid_syntax": syntax["is_valid"],
             "syntax_error": syntax["error_message"],
             "code_smells": smells,
-            "parser_engine": meta.get("parser_used", "none")
+            "parser_engine": meta.get("parser_used", "none"),
+            "is_async": meta.get("is_async", False),
         }
+
+        # ── Write full AST analysis to dedicated log file ──────────────────
+        try:
+            _log_ast_result(
+                phase="analyze_code_quality",
+                code_snippet=code,
+                language=norm_lang,
+                result=result,
+                extra={
+                    "raw_parser_meta": meta,
+                    "syntax_check": syntax,
+                    "lines_in_code": loc,
+                    "tree_sitter_available": _TREE_SITTER_AVAILABLE,
+                    "loaded_parsers": list(_PARSERS.keys()),
+                }
+            )
+        except Exception as log_err:
+            logger.debug(f"AST logger write error (non-critical): {log_err}")
+
+        return result
 
     @classmethod
     def extract_all_functions(cls, code: str, language: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -478,6 +594,26 @@ class CodeParserService:
                     return results
             except Exception as ts_err:
                 logger.debug(f"Tree-sitter file extraction notice: {ts_err}")
+
+        # ── Log the full-file extraction result ────────────────────────────
+        try:
+            al = _get_ast_logger()
+            sep = "=" * 80
+            al.debug(
+                f"\n{sep}\n"
+                f"PHASE        : extract_all_functions\n"
+                f"LANGUAGE     : {norm_lang}\n"
+                f"TOTAL FUNCTIONS FOUND: {len(results)}\n"
+                f"FUNCTION LIST:\n" +
+                "\n".join(
+                    f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
+                    f"| complexity {r.get('complexity')} | params {r.get('parameters')}"
+                    for i, r in enumerate(results)
+                ) +
+                f"\n{sep}\n"
+            )
+        except Exception as log_err:
+            logger.debug(f"AST logger write error (non-critical): {log_err}")
 
         return results
 

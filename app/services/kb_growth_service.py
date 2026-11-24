@@ -70,7 +70,29 @@ class KBGrowthService:
         programming_language = programming_language.lower().strip() or "general"
 
         with db_service.get_session() as session:
-            # Create FunctionRecord
+            # Conflict & Versioning Check
+            existing = (
+                session.query(FunctionRecord)
+                .filter_by(function_name=function_name)
+                .order_by(FunctionRecord.created_at.desc())
+                .first()
+            )
+            if existing:
+                conflict_status = "conflict_detected"
+                parent_id = existing.id
+                parts = (existing.version or "1.0.0").replace("v", "").split(".")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    parts[1] = str(int(parts[1]) + 1)
+                    version = ".".join(parts)
+                else:
+                    version = "1.1.0"
+            else:
+                conflict_status = "clean"
+                parent_id = None
+                version = version or "1.0.0"
+
+            # Create FunctionRecord in STAGING (verification_status='pending_review')
+            # Human verification is strictly required before it enters ChromaDB / active retrieval
             func = FunctionRecord(
                 rule_version_name=rule_version_name,
                 rule_version_description=f"Auto-learned function from user question: {original_query}",
@@ -82,6 +104,9 @@ class KBGrowthService:
                 version=version,
                 description=description,
                 knowledge_source="llm_generated",
+                verification_status="pending_review",  # Staged for human verification
+                conflict_status=conflict_status,
+                parent_function_id=parent_id,
                 created_at=datetime.datetime.utcnow(),
                 updated_at=datetime.datetime.utcnow()
             )
@@ -102,29 +127,23 @@ class KBGrowthService:
 
             record_id = func.id
 
-        # Upsert into ChromaDB so it's immediately searchable
-        chroma_service.upsert_function(
-            mysql_id=record_id,
-            function_name=function_name,
-            rule_version_name=rule_version_name,
-            rule_version_description=description,
-            function_header=function_header,
-            programming_language=programming_language,
-            framework=framework,
-            version=version,
-            description=description,
-            knowledge_source="llm_generated"
+        # NOTE: In accordance with human-in-the-loop policy, unverified chat-learned solutions
+        # are NOT pushed to ChromaDB until approved via the Knowledge Base Review Queue.
+        logger.info(
+            f"Staged LLM solution for human verification. Function ID: {record_id}, Name: {function_name}, "
+            f"Version: {version}, Conflict: {conflict_status}."
         )
-
-        logger.info(f"Successfully saved LLM solution into KB. Function ID: {record_id}, Name: {function_name}")
 
         return {
             "success": True,
             "function_id": record_id,
             "function_name": function_name,
+            "version": version,
+            "conflict_status": conflict_status,
+            "verification_status": "pending_review",
             "programming_language": programming_language,
             "knowledge_source": "llm_generated",
-            "message": "Solution successfully added to organizational knowledge base."
+            "message": f"Solution submitted to Staging Queue (Version {version}). A senior developer or admin will verify it before it becomes active in the Knowledge Base."
         }
 
     @classmethod
