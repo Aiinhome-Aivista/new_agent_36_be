@@ -1,3 +1,9 @@
+"""
+Database Models for DevKnow.
+Defines SQLAlchemy ORM entities representing knowledge base files,
+verified/staged code functions, LLM self-learned rules, ingestion audit logs,
+conversations, and message history with RAG grounding attribution.
+"""
 import datetime
 from sqlalchemy import (
     Column, Integer, String, Text, DateTime, Float, ForeignKey
@@ -7,6 +13,10 @@ from sqlalchemy.orm import declarative_base, relationship
 Base = declarative_base()
 
 class KnowledgeBaseFile(Base):
+    """
+    Represents an uploaded source file (Excel runbook, .py, .cs, .ts, .js, or .md documentation).
+    Tracks upload time, record processing metrics, and ingestion review status.
+    """
     __tablename__ = "knowledge_base_files"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -18,12 +28,14 @@ class KnowledgeBaseFile(Base):
     failed_records = Column(Integer, default=0)
     skipped_records = Column(Integer, default=0)
     languages_detected = Column(String(500), default="")
-    ingestion_status = Column(String(50), default="pending")  # completed, failed, partial
+    ingestion_status = Column(String(50), default="pending")  # 'pending', 'staged_for_review', 'completed', 'failed'
 
+    # Relationships
     functions = relationship("FunctionRecord", back_populates="source_file", cascade="all, delete-orphan")
     logs = relationship("IngestionLog", back_populates="file", cascade="all, delete-orphan")
 
     def to_dict(self):
+        """Serializes the file record into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "file_name": self.file_name,
@@ -39,6 +51,11 @@ class KnowledgeBaseFile(Base):
 
 
 class FunctionRecord(Base):
+    """
+    Core entity representing an organizational code function or architectural rule.
+    Stores exact compiler signatures, code body, language, cyclomatic complexity,
+    verification status (Human-in-the-Loop staging), and version lineage.
+    """
     __tablename__ = "functions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -56,16 +73,18 @@ class FunctionRecord(Base):
     additional_metadata = Column(Text, default="")
     knowledge_source = Column(String(50), default="excel", index=True)  # 'excel', 'code_file', 'doc_file', or 'llm_generated'
     verification_status = Column(String(50), default="verified", index=True)  # 'verified', 'pending_review', 'rejected'
-    conflict_status = Column(String(50), default="clean")  # 'clean', 'conflict_detected', 'version_increment'
+    conflict_status = Column(String(50), default="clean")  # 'clean', 'conflict_detected', 'new_function'
     parent_function_id = Column(Integer, nullable=True)
     source_file_id = Column(Integer, ForeignKey("knowledge_base_files.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
+    # Relationships
     source_file = relationship("KnowledgeBaseFile", back_populates="functions")
     llm_origin = relationship("LLMGeneratedKnowledge", back_populates="function_record", uselist=False)
 
     def to_dict(self):
+        """Serializes the function record into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "rule_version_name": self.rule_version_name,
@@ -91,6 +110,10 @@ class FunctionRecord(Base):
 
 
 class LLMGeneratedKnowledge(Base):
+    """
+    Stores self-learned knowledge items originating from developer chat sessions.
+    Linked to a newly created FunctionRecord when approved by a developer.
+    """
     __tablename__ = "llm_generated_knowledge"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -104,6 +127,7 @@ class LLMGeneratedKnowledge(Base):
     function_record = relationship("FunctionRecord", back_populates="llm_origin")
 
     def to_dict(self):
+        """Serializes the self-learned record into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "function_id": self.function_id,
@@ -116,6 +140,9 @@ class LLMGeneratedKnowledge(Base):
 
 
 class IngestionLog(Base):
+    """
+    Audit log record capturing individual row/function processing outcomes during file ingestion.
+    """
     __tablename__ = "ingestion_logs"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -128,6 +155,7 @@ class IngestionLog(Base):
     file = relationship("KnowledgeBaseFile", back_populates="logs")
 
     def to_dict(self):
+        """Serializes the ingestion log entry into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "file_id": self.file_id,
@@ -139,6 +167,10 @@ class IngestionLog(Base):
 
 
 class Conversation(Base):
+    """
+    Represents an interactive developer chat conversation thread.
+    Contains an ordered collection of user and assistant messages.
+    """
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -147,9 +179,15 @@ class Conversation(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
-    messages = relationship("ConversationMessage", back_populates="conversation", cascade="all, delete-orphan", order_by="ConversationMessage.created_at.asc()")
+    messages = relationship(
+        "ConversationMessage",
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="ConversationMessage.created_at.asc()"
+    )
 
     def to_dict(self):
+        """Serializes the conversation summary into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "session_id": self.session_id,
@@ -161,6 +199,12 @@ class Conversation(Base):
 
 
 class ConversationMessage(Base):
+    """
+    Represents a single message exchange within a conversation.
+    Stores the user prompt, attached code snippets, AI response,
+    query intent classification, retrieved runbook function IDs,
+    and RAG grounding attribution metrics (KB % vs LLM %).
+    """
     __tablename__ = "conversation_messages"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -168,7 +212,7 @@ class ConversationMessage(Base):
     role = Column(String(20), nullable=False)  # 'user', 'assistant'
     message = Column(Text, nullable=False)
     attached_code = Column(Text, nullable=True)
-    answer_source = Column(String(50), default="none")  # 'kb_hit', 'llm_fallback', 'none'
+    answer_source = Column(String(50), default="none")  # 'kb_hit', 'llm_fallback', 'guardrail_blocked'
     retrieved_function_ids = Column(Text, nullable=True)
     similarity_score = Column(Float, nullable=True)
     query_intent = Column(String(50), nullable=True)
@@ -178,6 +222,12 @@ class ConversationMessage(Base):
 
     @property
     def grounding_stats(self):
+        """
+        Computes user-facing RAG grounding metrics for assistant answers.
+        
+        Returns:
+            dict or None: Attribution breakdown showing % Knowledge Base vs % LLM synthesis.
+        """
         if self.role != "assistant":
             return None
         if self.answer_source == "kb_hit":
@@ -206,6 +256,7 @@ class ConversationMessage(Base):
         return None
 
     def to_dict(self):
+        """Serializes the conversation message into a JSON-compatible dictionary."""
         return {
             "id": self.id,
             "conversation_id": self.conversation_id,
@@ -219,4 +270,5 @@ class ConversationMessage(Base):
             "grounding_stats": self.grounding_stats,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
+
 

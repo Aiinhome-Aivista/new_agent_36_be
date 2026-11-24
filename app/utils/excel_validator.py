@@ -1,11 +1,32 @@
+"""
+Excel Validator Utility.
+Validates the structural integrity of company runbook spreadsheets (.xlsx, .xls),
+fuzzy-maps header columns to internal standard entity attributes,
+and verifies mandatory fields prior to vector and relational database ingestion.
+"""
 import os
 import pandas as pd
 from typing import Dict, List, Tuple, Any
 from app.config import Config
 
 class ExcelValidator:
+    """
+    Validates uploaded Excel files against company runbook schemas:
+    - Verifies file format and readable binary content.
+    - Resolves synonym/case-insensitive column headers (e.g. 'Function Header' vs 'Rule Version Script Header').
+    - Ensures mandatory code body and signature columns are present.
+    """
     @staticmethod
     def allowed_file(filename: str) -> bool:
+        """
+        Validates file extension to ensure only valid Excel workbooks are processed.
+        
+        Args:
+            filename: Original file name string.
+            
+        Returns:
+            bool: True if extension is .xlsx or .xls; False otherwise.
+        """
         return "." in filename and filename.rsplit(".", 1)[1].lower() in ["xlsx", "xls"]
 
     @staticmethod
@@ -13,6 +34,12 @@ class ExcelValidator:
         """
         Dynamically maps DataFrame columns to internal standard field names.
         First tests exact config mappings, then fuzzy matches common variations.
+        
+        Args:
+            df_columns: List of raw string column names extracted from the Excel sheet.
+            
+        Returns:
+            dict: Mapping of internal keys (e.g. 'script_header') to raw Excel column names.
         """
         clean_cols = {str(col).strip().lower(): col for col in df_columns}
         cfg = Config.EXCEL_COLUMNS
@@ -62,7 +89,7 @@ class ExcelValidator:
                     matched_col = clean_cols[p]
                     break
             if not matched_col:
-                # Substring check
+                # Substring fallback check
                 for col_clean, original_col in clean_cols.items():
                     for p in patterns:
                         if p in col_clean or col_clean in p:
@@ -78,13 +105,22 @@ class ExcelValidator:
     def validate_excel_structure(cls, file_path: str) -> Tuple[bool, str, Dict[str, str], List[str]]:
         """
         Validates file existence, format, and mandatory columns.
-        Returns: (is_valid, error_message, column_mapping, detected_languages)
+        
+        Args:
+            file_path: Absolute disk path to the uploaded Excel file.
+            
+        Returns:
+            Tuple[bool, str, Dict[str, str], List[str]]:
+                - is_valid (bool): Whether mandatory columns exist.
+                - error_message (str): Human-readable error description on failure.
+                - column_mapping (dict): Resolved column key-to-header map.
+                - detected_languages (list): Unique programming languages identified.
         """
         if not os.path.exists(file_path):
             return False, f"File does not exist at {file_path}", {}, []
 
         try:
-            # Read first few rows to check columns
+            # Read first few rows to quickly inspect columns without loading whole file
             df_preview = pd.read_excel(file_path, nrows=5)
         except Exception as e:
             return False, f"Unable to read Excel file: {str(e)}", {}, []
@@ -92,6 +128,7 @@ class ExcelValidator:
         columns = [str(c) for c in df_preview.columns]
         mapping = cls.resolve_column_mappings(columns)
 
+        # Enforce mandatory columns: Must have both signature and body
         missing = []
         if not mapping.get("script_header"):
             missing.append("Function/Script Header (e.g. 'Rule Version Script Header/Name' or 'Function Header')")
@@ -101,7 +138,7 @@ class ExcelValidator:
         if missing:
             return False, f"Excel file is missing required columns: {', '.join(missing)}", mapping, []
 
-        # Check language column
+        # Extract distinct languages listed in the dataset
         lang_col = mapping.get("language")
         detected_languages = []
         if lang_col and lang_col in df_preview.columns:
@@ -113,4 +150,5 @@ class ExcelValidator:
                 pass
 
         return True, "", mapping, detected_languages
+
 

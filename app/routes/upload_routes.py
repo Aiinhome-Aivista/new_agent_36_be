@@ -1,3 +1,15 @@
+"""
+Upload Routes Blueprint for DevKnow.
+
+Provides HTTP endpoints for ingesting knowledge files:
+1. `POST /api/knowledge-base/upload`:
+   Ingests structured Excel spreadsheets (.xlsx, .xls) containing rulebook scripts,
+   function headers, and code definitions.
+2. `POST /api/knowledge-base/upload-code-or-doc`:
+   Ingests raw source code files (.py, .cs, .ts, .js) or markdown/text documentation (.md, .txt),
+   parses them using Tree-sitter AST and LLM summarization, and stages them for human verification.
+"""
+
 import os
 import uuid
 import logging
@@ -12,11 +24,26 @@ from app.services.code_doc_ingestion_service import CodeDocIngestionService
 upload_bp = Blueprint("upload", __name__)
 logger = logging.getLogger("DevKnow.UploadRoutes")
 
+
 @upload_bp.route("/knowledge-base/upload", methods=["POST"])
 def upload_knowledge_base():
     """
-    Handles Excel knowledge base file upload.
-    Validates file, writes to disk, runs ingestion, returns summary.
+    Handles Excel knowledge base workbook uploads.
+
+    Workflow:
+    1. Validates multipart/form-data payload contains a valid file with allowed extension.
+    2. Generates collision-resistant unique filename and saves to `data/uploads/`.
+    3. Invokes ExcelIngestionService to validate columns, parse rows, detect deduplication,
+       and batch index vectors in ChromaDB.
+    4. Returns ingestion statistics (total, successful, failed, skipped, detected languages).
+
+    Request:
+        multipart/form-data with key 'file' (.xlsx or .xls)
+
+    Responses:
+        200: Successfully parsed and ingested file with detailed statistics.
+        400: Missing file, invalid extension, or malformed spreadsheet columns.
+        500: Server-side I/O or ingestion processing error.
     """
     if "file" not in request.files:
         return jsonify({"success": False, "error": "No file part in request"}), 400
@@ -38,7 +65,7 @@ def upload_knowledge_base():
 
     try:
         file.save(saved_path)
-        logger.info(f"File saved to {saved_path}. Starting ingestion...")
+        logger.info(f"File saved to {saved_path}. Starting Excel ingestion pipeline...")
 
         summary = ExcelIngestionService.ingest_excel_file(
             file_path=saved_path,
@@ -56,9 +83,29 @@ def upload_knowledge_base():
 @upload_bp.route("/knowledge-base/upload-code-or-doc", methods=["POST"])
 def upload_code_or_doc():
     """
-    Handles upload of source code files (.py, .cs, .ts, .js) or
-    developer documentation (.md, .txt).
-    Parses via AST + LLM, runs conflict check, and stages for human verification.
+    Handles upload of source code files or developer documentation.
+
+    Supported Formats:
+    - Code: .py, .cs, .ts, .js, .jsx, .tsx, .java, .go, .cpp
+    - Documentation: .md, .txt
+
+    Workflow:
+    1. Saves file to disk with unique prefix.
+    2. Uses Tree-sitter AST to parse and extract function signatures, lines, and complexity.
+    3. Uses Gemini LLM to generate concise business logic descriptions.
+    4. Enforces the Zero-Direct-Ingestion policy: stages extracted functions with
+       `verification_status='pending_review'` without immediately indexing into ChromaDB.
+    5. Returns staging list, conflict warnings, and generated Tree-sitter log filenames.
+
+    Request:
+        multipart/form-data:
+        - file: File binary
+        - notes: (Optional) Author/developer notes for context
+
+    Responses:
+        200: Successfully extracted and staged code functions or doc rules.
+        400: Unsupported format or empty file.
+        500: Server processing error.
     """
     if "file" not in request.files:
         return jsonify({"success": False, "error": "No file attached in upload"}), 400
@@ -82,7 +129,7 @@ def upload_code_or_doc():
 
     try:
         file.save(saved_path)
-        logger.info(f"Source code/doc saved to {saved_path}. Running AST extraction and staging...")
+        logger.info(f"Source code/doc saved to {saved_path}. Running Tree-sitter AST extraction and staging...")
 
         result = CodeDocIngestionService.ingest_code_or_doc_file(
             file_path=saved_path,
@@ -96,4 +143,3 @@ def upload_code_or_doc():
     except Exception as e:
         logger.exception(f"Error handling code/doc upload: {e}")
         return jsonify({"success": False, "error": f"Upload processing error: {str(e)}"}), 500
-

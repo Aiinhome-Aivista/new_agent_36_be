@@ -1,28 +1,59 @@
-import re
-from typing import Dict, Any, Optional
+"""
+Query Router & Security Inspection Module for DevKnow.
 
+Analyzes incoming user queries, inspects for adversarial prompt injection attempts,
+classifies technical intent, detects source/target programming languages,
+and determines RAG vector search filtering directives.
+
+Security Guardrails:
+1. Prompt Injection & Jailbreak Defense:
+   - Instruction overrides (e.g. 'ignore previous rules', 'bypass guidelines').
+   - Jailbreak personas ('DAN', 'Developer Mode', 'Unrestricted mode').
+   - System prompt extraction & leakage attacks ('repeat system prompt verbatim').
+   - Role spoofing & delimiter injection ('system:', 'human:', '<|im_start|>').
+2. Domain Boundary Enforcement:
+   - Identifies out-of-scope non-technical queries (politics, world leaders, sports, recipes)
+     to prevent misuse and maintain enterprise focus.
+
+Intent Categories:
+- `code_conversion`: Migrating code between languages (e.g. C# -> TypeScript).
+- `code_improvement`: Refactoring, optimizing, and security hardening.
+- `code_analysis`: Inspecting bugs, code smells, and cyclomatic complexity.
+- `cross_language`: Querying equivalent libraries across language ecosystems.
+- `version_lookup`: Checking semantic version history or deprecations.
+- `function_explanation`: Architectural and business logic explanations.
+- `code_similarity`: Searching for reusable or duplicate enterprise functions.
+- `function_lookup`: Finding specific existing runbooks or functions.
+- `greeting`: Conversational pleasantries.
+"""
+
+import re
+from typing import Dict, Any, Optional, List
+
+# ── 1. Adversarial Prompt Injection Defense Regex Patterns ──────────────────
 PROMPT_INJECTION_PATTERNS = [
-    # 1. Instruction overrides & memory wipes
+    # Category A: Instruction overrides & memory wipes
     r"\b(ignore|disregard|forget|override|bypass|clear|drop)\s+(all\s+)?(previous|prior|above|past|initial|system)\s+(instructions|prompts|rules|commands|constraints|guidelines|directives)\b",
     r"\b(ignore|disregard|forget)\s+everything\s+(above|previously\s+said|before)\b",
     r"\bfrom\s+now\s+on\b.*?\b(ignore|disregard|forget|you\s+are\s+no\s+longer|you\s+must\s+obey)\b",
-    
-    # 2. Jailbreak personas & modes (DAN, Developer Mode, Unrestricted, AIM)
+
+    # Category B: Jailbreak personas & modes (DAN, Developer Mode, Unrestricted, AIM)
     r"\b(you\s+are\s+now|act\s+as|roleplay\s+as|pretend\s+to\s+be)\s+(an?\s+)?(dan|unrestricted|jailbreak|jailbroken|evil|unfiltered|uncensored|developer\s+mode|god\s+mode|root)\b",
     r"\b(dan\s+mode|developer\s+mode\s+enabled|jailbreak\s+prompt|do\s+anything\s+now)\b",
     r"\bpretend\s+(you\s+have\s+no\s+rules|there\s+are\s+no\s+restrictions|safety\s+filters\s+are\s+off)\b",
     r"\b(bypass|disable|turn\s+off)\s+(all\s+)?(safety|guardrails?|security|filters?|content\s+filters?|rules)\b",
-    
-    # 3. System prompt & instruction extraction / leakage
+
+    # Category C: System prompt & instruction extraction / leakage
     r"\b(repeat|print|reveal|output|display|show|leak|echo|dump)\s+(your\s+|the\s+)?(system\s+prompt|initial\s+prompt|system\s+instructions?|internal\s+instructions?|base\s+prompt|secret\s+instructions?|hidden\s+prompt)\b",
     r"\b(what\s+is\s+your\s+system\s+prompt|what\s+are\s+your\s+instructions\s+above|repeat\s+everything\s+above)\b",
     r"\boutput\s+the\s+initial\s+text\s+verbatim\b",
-    
-    # 4. Role spoofing & delimiter injection
+
+    # Category D: Role spoofing & delimiter injection
     r"(^|\n)\s*(system:\s*|human:\s*|assistant:\s*|###\s*instruction|\[system\s*instruction\]|<\|im_start\|>|<system>|\[INST\])",
     r"\b(sudo\s+mode|admin\s+override|system\s+override|root\s+access\s+granted)\b"
 ]
 
+# ── 2. Intent Classification Patterns ────────────────────────────────────────
 INTENT_PATTERNS = {
     "out_of_scope": [
         # Political / world leaders / government / elections
@@ -79,23 +110,55 @@ INTENT_PATTERNS = {
     ]
 }
 
+# ── 3. Known Languages Lexicon ───────────────────────────────────────────────
 KNOWN_LANGUAGES = [
     "python", "java", "javascript", "typescript", "c#", "csharp", "c++", "cpp",
     "c", "go", "golang", "php", "ruby", "kotlin", "swift", "sql", "rust", "scala"
 ]
 
+
 class QueryRouter:
+    """
+    Query classification and security routing engine.
+    Analyzes user prompts prior to retrieval vectorization or model invocation.
+    """
+
     @classmethod
-    def route_query(cls, query: str, user_selected_language: Optional[str] = None, attached_code: Optional[str] = None) -> Dict[str, Any]:
+    def route_query(
+        cls,
+        query: str,
+        user_selected_language: Optional[str] = None,
+        attached_code: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Classifies user query intent, inspects for adversarial prompt injection,
-        extracts referenced languages, and provides routing directives for the RAG pipeline.
+        Classifies user query intent, checks for adversarial injection patterns,
+        extracts referenced languages, and produces routing directives for the RAG engine.
+
+        Pipeline:
+        1. Security Screening: Checks query and code against `PROMPT_INJECTION_PATTERNS`.
+        2. Intent Classification: Matches against technical and guardrail intent patterns.
+        3. Language Extraction: Parses source language and target language (e.g. in code conversion).
+        4. Filter Resolution: Combines user UI selection with query language hints.
+
+        Args:
+            query: The user prompt string.
+            user_selected_language: Language filter selected in the chat UI dropdown ('all' or language name).
+            attached_code: Optional code snippet attached by the user.
+
+        Returns:
+            Dict containing:
+            - `intent`: Detected intent key (e.g. 'code_improvement', 'prompt_injection', 'out_of_scope').
+            - `filter_language`: Language string to filter vector search by, or None.
+            - `target_language`: Conversion target language (if intent is code_conversion).
+            - `extracted_languages`: List of all programming languages recognized in query text.
+            - `requires_mysql_body`: Boolean indicating if detailed code implementations are needed.
+            - `security_flag`: True if prompt injection attack was detected.
         """
         clean_query = query.strip()
         lower_query = clean_query.lower()
         combined_text = lower_query + ("\n" + attached_code.lower() if attached_code else "")
 
-        # 0. Prompt Injection & Security Guardrail
+        # 0. Prompt Injection & Security Guardrail Check
         for pattern in PROMPT_INJECTION_PATTERNS:
             if re.search(pattern, combined_text):
                 return {
@@ -115,19 +178,16 @@ class QueryRouter:
                 break
 
         # 2. Extract Source and Target Programming Languages
-        extracted_languages = []
+        extracted_languages: List[str] = []
         for lang in KNOWN_LANGUAGES:
-            # Word boundary matching
             escaped = re.escape(lang)
             if re.search(rf"\b{escaped}\b", lower_query):
                 std_lang = "c#" if lang in ["csharp", "c#"] else ("go" if lang == "golang" else ("c++" if lang == "cpp" else lang))
                 if std_lang not in extracted_languages:
                     extracted_languages.append(std_lang)
 
-        # Detect conversion target (e.g. "convert to Java", "in Python")
+        # Detect conversion target (e.g. "convert to Java", "port to TypeScript")
         target_language = None
-        source_language = None
-
         if detected_intent == "code_conversion":
             conv_match = re.search(r"\b(?:to|into)\s+([a-zA-Z#+]+)", lower_query)
             if conv_match:
@@ -137,7 +197,7 @@ class QueryRouter:
                         target_language = "c#" if lang in ["csharp", "c#"] else ("go" if lang == "golang" else ("c++" if lang == "cpp" else lang))
                         break
 
-        # Determine effective filter language
+        # 3. Determine effective filter language
         filter_language = None
         if user_selected_language and user_selected_language.lower() != "all":
             filter_language = user_selected_language.lower()
@@ -150,8 +210,8 @@ class QueryRouter:
             "target_language": target_language,
             "extracted_languages": extracted_languages,
             "requires_mysql_body": detected_intent in [
-                "function_explanation", "code_improvement", "code_conversion",
-                "code_analysis", "function_lookup", "code_similarity"
-            ]
+                "code_improvement", "code_conversion", "code_analysis",
+                "function_lookup", "code_similarity"
+            ],
+            "security_flag": False
         }
-

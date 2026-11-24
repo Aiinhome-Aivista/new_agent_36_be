@@ -1,3 +1,13 @@
+"""
+Function Catalog Routes Blueprint for DevKnow.
+
+Provides searchable catalog and detail endpoints for indexed organizational functions:
+1. `GET /api/functions`:
+   Paginated, multi-field search over functions by keyword, language, framework, or knowledge source.
+2. `GET /api/functions/<id>`:
+   Retrieves exact original function implementation, metadata, and syntax parameters.
+"""
+
 import logging
 from flask import Blueprint, request, jsonify
 from sqlalchemy import or_
@@ -8,11 +18,28 @@ from app.models.database_models import FunctionRecord
 function_bp = Blueprint("functions", __name__)
 logger = logging.getLogger("DevKnow.FunctionRoutes")
 
+
 @function_bp.route("/functions", methods=["GET"])
 def list_functions():
     """
-    Searchable function browser endpoint.
-    Filters: query, language, framework, source (excel/llm_generated), page, limit.
+    Searchable and paginated function browser endpoint.
+
+    Query Parameters:
+        - q: (Optional) Search query matched across function_name, rule_version_name,
+             description, and function_header.
+        - language: (Optional) Programming language filter (e.g. 'c#', 'python', 'all').
+        - framework: (Optional) Framework filter (e.g. '.NET Core', 'Flask', 'all').
+        - source: (Optional) Knowledge source filter ('excel', 'llm_generated', 'code_file', 'all').
+        - page: (Optional) Page number (1-based, default: 1).
+        - limit: (Optional) Items per page (default: 20, max: 100).
+
+    Responses:
+        200: JSON containing:
+            - total: Total number of matching records.
+            - page: Current page number.
+            - limit: Page size.
+            - pages: Total number of pages.
+            - functions: List of serialized FunctionRecord objects.
     """
     query_str = request.args.get("q", "").strip()
     language = request.args.get("language", "").strip().lower()
@@ -57,9 +84,19 @@ def list_functions():
             "functions": [r.to_dict() for r in records]
         })
 
+
 @function_bp.route("/functions/<int:func_id>", methods=["GET"])
-def get_function(func_id):
-    """Retrieves exact original function implementation and metadata from MySQL"""
+def get_function(func_id: int):
+    """
+    Retrieves exact original function implementation and metadata from relational storage.
+
+    Path Parameters:
+        func_id: Primary key ID of the function.
+
+    Responses:
+        200: JSON object containing full FunctionRecord details.
+        404: Function not found error.
+    """
     with db_service.get_session() as session:
         record = session.query(FunctionRecord).filter_by(id=func_id).first()
         if not record:
@@ -69,4 +106,3 @@ def get_function(func_id):
             "success": True,
             "function": record.to_dict()
         })
-

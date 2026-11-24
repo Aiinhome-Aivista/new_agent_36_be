@@ -1,6 +1,14 @@
+"""
+Language Detector Utility.
+Provides fast, deterministic heuristic pattern recognition to detect
+programming languages from unlabelled source code snippets.
+Used when code is pasted into chat without explicit language tagging.
+"""
 import re
 from typing import Optional
 
+# Characteristic syntactic patterns for each supported programming language.
+# Patterns are weighted by occurrence to distinguish between similar languages.
 LANGUAGE_PATTERNS = {
     "c#": [
         r"\bbool\s+\w+\s*\(", r"\bvoid\s+\w+\s*\(", r"\bstring\s+\w+",
@@ -42,7 +50,16 @@ LANGUAGE_PATTERNS = {
 }
 
 def detect_language_from_code(code_str: str) -> Optional[str]:
-    """Lightweight rule-based programming language detection"""
+    """
+    Detects the programming language of a code snippet via regex pattern frequency.
+    
+    Args:
+        code_str: Raw source code string pasted by user or extracted from markdown.
+        
+    Returns:
+        str or None: Lowercase language name (e.g. 'c#', 'python', 'typescript')
+                     or None if insufficient distinctive syntax is present.
+    """
     if not code_str or not code_str.strip():
         return None
 
@@ -56,8 +73,10 @@ def detect_language_from_code(code_str: str) -> Optional[str]:
             scores[lang] = score
 
     if scores:
+        # Pick the language with the highest cumulative regex match count
         best_match = max(scores.items(), key=lambda x: x[1])
         return best_match[0]
 
     return None
+
 
