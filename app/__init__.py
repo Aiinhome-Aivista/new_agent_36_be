@@ -16,6 +16,7 @@ from app.routes.knowledge_base_routes import kb_bp
 from app.routes.function_routes import function_bp
 from app.routes.chat_routes import chat_bp
 from app.routes.admin_routes import admin_bp
+from app.routes.codebase_routes import codebase_bp
 
 def create_app() -> Flask:
     """
@@ -77,6 +78,7 @@ def create_app() -> Flask:
     app.register_blueprint(function_bp, url_prefix=prefix)
     app.register_blueprint(chat_bp, url_prefix=prefix)
     app.register_blueprint(admin_bp, url_prefix=prefix)
+    app.register_blueprint(codebase_bp, url_prefix=prefix)
 
     # Standardized 404 handler returning JSON instead of default HTML
     @app.errorhandler(404)

@@ -166,6 +166,56 @@ class IngestionLog(Base):
         }
 
 
+class CodebaseIngestionJob(Base):
+    """
+    Tracks the lifecycle of an async whole-codebase ingestion job.
+
+    When a user uploads a .zip archive containing multiple source files, the backend
+    processes them asynchronously in a background thread to avoid HTTP timeouts.
+    This model records the job's status, progress, and final summary so the frontend
+    can poll GET /api/codebase/status/{job_id} and display a real-time progress bar.
+
+    Lifecycle:
+        queued → processing → completed | failed
+    """
+    __tablename__ = "codebase_ingestion_jobs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    job_id = Column(String(100), unique=True, nullable=False, index=True)
+    archive_name = Column(String(255), nullable=False)        # Original .zip filename
+    status = Column(String(50), default="queued", index=True) # queued | processing | completed | failed
+    total_files = Column(Integer, default=0)                  # Files found in archive
+    processed_files = Column(Integer, default=0)              # Files finished (success or skip)
+    skipped_files = Column(Integer, default=0)                # Skipped: unsupported extension or duplicate hash
+    total_functions_staged = Column(Integer, default=0)       # Total functions put in staging queue
+    total_conflicts = Column(Integer, default=0)              # Functions with version conflicts
+    error_message = Column(Text, nullable=True)               # Set only on status='failed'
+    result_summary = Column(Text, nullable=True)              # JSON blob of per-file results
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self):
+        """Serializes the job record for the status polling API response."""
+        progress_pct = 0
+        if self.total_files and self.total_files > 0:
+            progress_pct = round((self.processed_files / self.total_files) * 100, 1)
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "archive_name": self.archive_name,
+            "status": self.status,
+            "progress_percent": progress_pct,
+            "total_files": self.total_files,
+            "processed_files": self.processed_files,
+            "skipped_files": self.skipped_files,
+            "total_functions_staged": self.total_functions_staged,
+            "total_conflicts": self.total_conflicts,
+            "error_message": self.error_message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
 class Conversation(Base):
     """
     Represents an interactive developer chat conversation thread.
