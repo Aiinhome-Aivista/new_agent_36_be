@@ -1,11 +1,17 @@
+"""
+Centralized Configuration Module for DevKnow.
+Loads environment variables from .env, defines system paths,
+database connection strings, LLM provider settings, vector database configuration,
+and Excel ingestion schema mappings.
+"""
 import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Base backend directory
+# Base backend directory: <root>/new_agent_36_be/
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env file
+# Load .env file automatically from backend root
 env_path = BASE_DIR / ".env"
 if env_path.exists():
     load_dotenv(dotenv_path=env_path)
@@ -13,6 +19,10 @@ else:
     load_dotenv()
 
 class Config:
+    """
+    Application-wide configuration object referenced across routes and services.
+    Encapsulates all runtime tunables and storage paths.
+    """
     BASE_DIR = BASE_DIR
     APP_NAME = os.getenv("APP_NAME", "DevKnow - Multi-Language Developer Knowledge Assistant")
     APP_ENV = os.getenv("APP_ENV", "development")
@@ -24,13 +34,13 @@ class Config:
     API_PREFIX = os.getenv("API_PREFIX", "/api")
     FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
-    # Database Settings (Single-line Connection String URI)
+    # Database Settings (Primary remote MySQL or local connection string URI)
     DATABASE_URL = os.getenv(
         "DATABASE_URL",
         "mysql+pymysql://root:@localhost:3306/devknow_db?charset=utf8mb4"
     ).strip()
 
-    # Legacy individual field fallbacks (if DATABASE_URL is not set)
+    # Legacy individual field fallbacks (used only if DATABASE_URL is omitted)
     DB_PROVIDER = os.getenv("DB_PROVIDER", "MYSQL").upper()
     DB_HOST = os.getenv("DB_HOST", "localhost")
     DB_PORT = int(os.getenv("DB_PORT", 3306))
@@ -38,17 +48,18 @@ class Config:
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
     DB_NAME = os.getenv("DB_NAME", "devknow_db")
 
-    # Storage Paths
+    # Storage Paths on disk
     UPLOAD_PATH = BASE_DIR / os.getenv("UPLOAD_PATH", "data/uploads")
     CHROMA_PATH = BASE_DIR / os.getenv("CHROMA_PATH", "data/chroma_db")
     LOGS_PATH = BASE_DIR / os.getenv("LOGS_PATH", "data/logs")
+    TREESITTER_LOGS_PATH = LOGS_PATH / "treesitter"
     MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", 50))
     MAX_CONTENT_LENGTH = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
     # LLM Provider Configuration
-    # Active Provider Options: "gemini" | "openai" | "claude" | "azure_openai" | "custom"
+    # Supported options: "gemini" | "openai" | "claude" | "azure_openai" | "custom"
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
-    LLM_MODE = os.getenv("LLM_MODE", "STRICT").upper()
+    LLM_MODE = os.getenv("LLM_MODE", "STRICT").upper()  # STRICT = low temperature 0.1 for zero-hallucination
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", 0.1 if LLM_MODE == "STRICT" else 0.7))
     LLM_TOP_P = float(os.getenv("LLM_TOP_P", 0.95))
     LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", 8192))
@@ -78,19 +89,19 @@ class Config:
     LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", 300))
 
     # Embedding Settings & Modes
-    # EMBEDDING_PROVIDER options: "LOCAL" (SentenceTransformers on CPU, 100% free & offline)
-    #                             "GEMINI" (Google Gemini text-embedding-004, 768-dim cloud API)
+    # Options: "LOCAL" (SentenceTransformers on CPU, 100% free & offline)
+    #          "GEMINI" (Google Gemini text-embedding-004 API)
     EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "LOCAL").upper()
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     GEMINI_EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "models/text-embedding-004")
 
-    # RAG Settings
+    # RAG Tuning Parameters
     RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", 5))
     SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.50))
     CONVERSATION_MEMORY_TURNS = int(os.getenv("CONVERSATION_MEMORY_TURNS", 10))
     AUTO_SAVE_LLM_ANSWERS = os.getenv("AUTO_SAVE_LLM_ANSWERS", "false").lower() == "true"
 
-    # Configurable Excel Column Mapping
+    # Configurable Excel Column Mapping (matches company runbook spreadsheet columns)
     EXCEL_COLUMNS = {
         "rule_version_name": os.getenv("COL_RULE_NAME", "RuleVersionName"),
         "rule_version_description": os.getenv("COL_RULE_DESC", "RuleVersionDescription"),
@@ -106,10 +117,16 @@ class Config:
     }
 
     @classmethod
-    def get_database_uri(cls):
-        """Constructs or returns SQLAlchemy Database URI"""
+    def get_database_uri(cls) -> str:
+        """
+        Constructs and normalizes the SQLAlchemy Database URI.
+        Normalizes standard mysql:// to mysql+pymysql:// for PyMySQL driver compatibility.
+        Falls back to local SQLite if MySQL URL is omitted.
+        
+        Returns:
+            str: Connection URI string for SQLAlchemy engine creation.
+        """
         if cls.DATABASE_URL:
-            # Normalize standard mysql:// to mysql+pymysql:// for PyMySQL driver
             if cls.DATABASE_URL.startswith("mysql://"):
                 return cls.DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
             return cls.DATABASE_URL
@@ -124,9 +141,11 @@ class Config:
         return f"sqlite:///{sqlite_dir / 'devknow.db'}"
 
     @classmethod
-    def ensure_directories(cls):
-        """Ensures required data and upload directories exist"""
+    def ensure_directories(cls) -> None:
+        """Ensures all required data, vector store, and logging directories exist on disk."""
         cls.UPLOAD_PATH.mkdir(parents=True, exist_ok=True)
         cls.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         cls.LOGS_PATH.mkdir(parents=True, exist_ok=True)
+        cls.TREESITTER_LOGS_PATH.mkdir(parents=True, exist_ok=True)
+
 

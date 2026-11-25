@@ -2,15 +2,20 @@
 CodeDocIngestionService: Ingestion engine for source code files (.py, .cs, .ts, .js)
 and unstructured developer documentation (.md, .txt).
 
-Key Principles:
-1. AST + Tree-sitter Extracts Deterministic Facts (signatures, params, complexity, syntax).
-2. LLM Extracts Semantic Context (purpose, organizational rules, edge cases).
-3. Zero-Direct-Ingestion: All extracted items enter a Staging Queue (verification_status='pending_review').
-4. Conflict & Versioning: Detects duplicate/conflicting function names and suggests next version (e.g. v1.1.0).
-5. Only Human-Approved functions are pushed to the ChromaDB vector index and become active in chat retrieval.
+Architectural Principles:
+1. Deterministic Extraction: Uses unified Tree-sitter AST to extract signatures, parameters,
+   cyclomatic complexity, and syntax validation.
+2. Semantic Contextualization: Uses Gemini LLM to synthesize concise business logic summaries.
+3. Staging Queue Pattern (Zero-Direct-Ingestion): Extracted functions enter database as
+   `verification_status='pending_review'`.
+4. Conflict & Version Tracking: Identifies pre-existing function names, detects version drift,
+   and proposes incremental semantic versioning (e.g. 1.0.0 -> 1.1.0).
+5. Human Verification Gate: Only human-verified items are upserted into ChromaDB vector index.
 """
+
 import os
 import re
+import json
 import datetime
 import logging
 from typing import Dict, Any, List, Optional
@@ -26,6 +31,12 @@ logger = logging.getLogger("DevKnow.CodeDocIngestion")
 
 
 class CodeDocIngestionService:
+    """
+    Ingestion engine responsible for parsing code files and developer markdown documentation,
+    performing Tree-sitter AST fact-extraction, staging records for review, and committing
+    approved records to the ChromaDB vector store.
+    """
+
     SUPPORTED_CODE_EXTENSIONS = {
         ".py": "python",
         ".cs": "c_sharp",
@@ -48,11 +59,29 @@ class CodeDocIngestionService:
 
     @classmethod
     def is_supported_file(cls, filename: str) -> bool:
+        """
+        Checks whether the file extension is supported for ingestion.
+
+        Args:
+            filename: File name or path.
+
+        Returns:
+            bool: True if supported code or documentation format.
+        """
         ext = Path(filename).suffix.lower()
         return ext in cls.SUPPORTED_CODE_EXTENSIONS or ext in cls.SUPPORTED_DOC_EXTENSIONS
 
     @classmethod
     def get_file_type(cls, filename: str) -> str:
+        """
+        Determines the internal file type category ('code', 'doc', or 'unknown').
+
+        Args:
+            filename: File name or path.
+
+        Returns:
+            str: 'code', 'doc', or 'unknown'.
+        """
         ext = Path(filename).suffix.lower()
         if ext in cls.SUPPORTED_CODE_EXTENSIONS:
             return "code"
@@ -68,13 +97,25 @@ class CodeDocIngestionService:
         author_notes: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Parses a code file or documentation file, runs Tree-sitter AST analysis on all code units,
-        uses LLM for contextual understanding, writes logs to data/logs/, and stages results.
+        Processes an uploaded source code or documentation file:
+        1. Validates existence and decodes file content.
+        2. Records entry in KnowledgeBaseFile table.
+        3. Routes to `_process_code_file` or `_process_doc_file`.
+        4. Stages all extracted items into the verification queue.
+
+        Args:
+            file_path: Absolute filesystem path of the uploaded file.
+            original_filename: User-facing file name.
+            author_notes: Optional developer/author guidelines.
+
+        Returns:
+            Dict containing staging summary, conflict count, and file metadata.
         """
         file_path_obj = Path(file_path)
         if not file_path_obj.exists():
             return {"success": False, "error": f"File not found: {file_path}"}
 
+        # Resilient decoding: try UTF-8 first, fallback to Latin-1
         try:
             content = file_path_obj.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -92,7 +133,7 @@ class CodeDocIngestionService:
                 "error": f"Unsupported file type '{ext}'. Supported: .py, .cs, .ts, .js, .java, .go, .cpp, .c, .md, .txt"
             }
 
-        # Optional tracking record in knowledge_base_files (graceful fallback if DB offline)
+        # Initialize tracking record in knowledge_base_files (graceful fallback if DB offline)
         file_id = 0
         try:
             with db_service.get_session() as session:
@@ -124,12 +165,24 @@ class CodeDocIngestionService:
         file_id: int,
         author_notes: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Extracts all functions via Tree-sitter AST, writes to data/logs, and saves to Staging Queue"""
-        # Deterministic function extraction via Tree-sitter with dedicated log writing
-        extracted = code_parser.extract_all_functions(code_content, language, filename=filename)
+        """
+        Extracts all function definitions via Tree-sitter AST, detects name collisions,
+        generates semantic descriptions via LLM, and inserts records into the Staging Queue.
+
+        Args:
+            code_content: Full text of source code file.
+            filename: Source file name.
+            language: Normalized programming language.
+            file_id: KnowledgeBaseFile foreign key id.
+            author_notes: Optional context passed by uploader.
+
+        Returns:
+            Dict containing staging results.
+        """
+        extracted = code_parser.extract_all_functions(code_content, language, source_filename=filename)
 
         if not extracted:
-            # Fall back to single function parsing if whole file extraction didn't yield blocks
+            # Fall back to single function parsing if whole-file extraction didn't yield blocks
             meta = code_parser.parse_function_metadata(code_content, language)
             if meta.get("function_name") and meta["function_name"] != "unnamed_function":
                 lines = code_content.splitlines()
@@ -150,15 +203,14 @@ class CodeDocIngestionService:
         if not extracted:
             return {
                 "success": False,
-                "error": f"No functions or methods could be identified in '{filename}' via Tree-sitter / AST.",
+                "error": f"No functions or methods could be identified in '{filename}' via Tree-sitter.",
                 "file_id": file_id
             }
 
-        staged_items = []
+        staged_items: List[Dict[str, Any]] = []
         conflicts_count = 0
-
-        # Try to persist into MySQL Staging Queue if database is available
         db_persisted = False
+
         try:
             with db_service.get_session() as session:
                 for item in extracted:
@@ -169,7 +221,7 @@ class CodeDocIngestionService:
                     params = item.get("parameters", [])
                     ret_type = item.get("return_type", "")
 
-                    # 1. Conflict & Versioning Check: Does function already exist in KB?
+                    # 1. Conflict & Versioning Check: Check if function exists in KB
                     existing = (
                         session.query(FunctionRecord)
                         .filter_by(function_name=fn_name)
@@ -210,7 +262,7 @@ class CodeDocIngestionService:
                         framework=Path(filename).suffix.lstrip("."),
                         version=next_version,
                         description=description,
-                        additional_metadata=f"AST Complexity: {complexity} | Params: {', '.join(params)} | Lines: {item.get('start_line', 1)}-{item.get('end_line', 1)}",
+                        additional_metadata=f"Tree-sitter Complexity: {complexity} | Params: {', '.join(params)} | Lines: {item.get('start_line', 1)}-{item.get('end_line', 1)}",
                         knowledge_source="code_file",
                         verification_status="pending_review",
                         conflict_status=conflict_status,
@@ -280,8 +332,7 @@ class CodeDocIngestionService:
             "total_extracted": len(staged_items),
             "conflicts_count": conflicts_count,
             "staged_functions": staged_items,
-            "db_persisted": db_persisted,
-            "message": f"Successfully extracted {len(staged_items)} function(s) via Tree-sitter AST. Log saved to data/logs/ast_extraction.log and data/logs/ast_upload_{filename}.log"
+            "message": f"Successfully extracted {len(staged_items)} function(s) via Tree-sitter. Staged for human verification before indexing into Knowledge Base."
         }
 
     @classmethod
@@ -294,14 +345,22 @@ class CodeDocIngestionService:
     ) -> Dict[str, Any]:
         """
         Parses unstructured documentation (.md, .txt), finds code blocks,
-        runs AST on each snippet, attaches surrounding prose as context,
+        runs Tree-sitter on each snippet, attaches surrounding prose as context,
         and stages for human verification.
+
+        Args:
+            doc_content: Full text of document.
+            filename: Document file name.
+            file_id: KnowledgeBaseFile record id.
+            author_notes: Optional developer guidelines.
+
+        Returns:
+            Dict containing staging summary and artifacts path.
         """
-        # Match fenced code blocks: ```lang\ncode\n```
         pattern = r"```([a-zA-Z0-9_#+]*)\s*\n(.*?)```"
         matches = list(re.finditer(pattern, doc_content, re.DOTALL))
 
-        staged_items = []
+        staged_items: List[Dict[str, Any]] = []
         conflicts_count = 0
 
         with db_service.get_session() as session:
@@ -313,17 +372,19 @@ class CodeDocIngestionService:
 
                 lang = code_parser.normalize_language(raw_lang)
 
-                # AST inspection on this snippet
+                # Tree-sitter inspection on this snippet
                 ast_meta = code_parser.parse_function_metadata(code_snippet, lang)
                 fn_name = ast_meta.get("function_name")
                 if not fn_name or fn_name == "unnamed_function":
-                    # Derive a clean name from document context
                     fn_name = f"doc_rule_{Path(filename).stem}_{idx+1}"
 
                 # Extract preceding text (up to 400 chars) as senior developer doc context
                 start_pos = m.start()
                 preceding_text = doc_content[max(0, start_pos - 400):start_pos].strip()
-                doc_context_summary = " ".join([line.strip() for line in preceding_text.splitlines() if line.strip() and not line.startswith("#")][-3:])
+                doc_context_summary = " ".join([
+                    line.strip() for line in preceding_text.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ][-3:])
 
                 # Conflict check
                 existing = (
@@ -343,7 +404,6 @@ class CodeDocIngestionService:
                     next_version = "1.0.0"
 
                 description = doc_context_summary or f"Architectural rule and code snippet from documentation '{filename}'."
-
                 first_line = code_snippet.splitlines()[0][:150]
 
                 staged_record = FunctionRecord(
@@ -356,9 +416,9 @@ class CodeDocIngestionService:
                     framework="documentation",
                     version=next_version,
                     description=description,
-                    additional_metadata=f"Extracted via AST + Document Parser | Snippet #{idx+1} | Source: {filename}",
+                    additional_metadata=f"Extracted via Tree-sitter + Doc Parser | Snippet #{idx+1} | Source: {filename}",
                     knowledge_source="doc_file",
-                    verification_status="pending_review",  # Human review required
+                    verification_status="pending_review",
                     conflict_status=conflict_status,
                     parent_function_id=parent_id,
                     source_file_id=file_id,
@@ -385,6 +445,59 @@ class CodeDocIngestionService:
 
         logger.info(f"Staged {len(staged_items)} code snippet(s) from doc '{filename}' for human verification.")
 
+        # Generate dedicated Tree-sitter JSON and Log for doc file
+        try:
+            base_dir = Path(__file__).resolve().parent.parent.parent
+            ts_dir = base_dir / "data" / "logs" / "treesitter"
+            ts_dir.mkdir(parents=True, exist_ok=True)
+
+            clean_stem = re.sub(r'[^a-zA-Z0-9_-]', '_', Path(filename).stem)
+            clean_ext = Path(filename).suffix.lstrip(".")
+            file_tag = f"{clean_stem}_{clean_ext}" if clean_ext else clean_stem
+            ts_str = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+            doc_report = {
+                "source_file": filename,
+                "file_type": "documentation",
+                "engine": "tree-sitter",
+                "generated_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "total_extracted": len(staged_items),
+                "staged_items": staged_items
+            }
+
+            per_doc_json = ts_dir / f"treesitter_{file_tag}_{ts_str}.json"
+            per_doc_json.write_text(json.dumps(doc_report, indent=2), encoding="utf-8")
+
+            per_doc_log = ts_dir / f"treesitter_{file_tag}_{ts_str}.log"
+            sep = "=" * 80
+            log_body = (
+                f"{sep}\n"
+                f"TREE-SITTER DOCUMENTATION EXTRACTION REPORT: {filename}\n"
+                f"TIMESTAMP                                  : {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"PARSER ENGINE                              : Tree-sitter\n"
+                f"TOTAL CODE SNIPPETS / RULES FOUND          : {len(staged_items)}\n"
+                f"{sep}\n\n"
+            )
+            for idx, item in enumerate(staged_items):
+                log_body += (
+                    f"[{idx+1}] Function/Rule: {item['function_name']}\n"
+                    f"    Language     : {item['language']}\n"
+                    f"    Version      : {item['version']}\n"
+                    f"    Status       : {item['conflict_status']}\n"
+                    f"    Description  : {item['description']}\n\n"
+                )
+            per_doc_log.write_text(log_body, encoding="utf-8")
+
+            print(f"\n{sep}", flush=True)
+            print(f"  [Tree-sitter Engine] Documentation Ingestion Complete:", flush=True)
+            print(f"- Source File               : {filename}", flush=True)
+            print(f"- Total Snippets/Rules      : {len(staged_items)}", flush=True)
+            print(f"  Dedicated Tree-sitter Log  -> {per_doc_log.name}", flush=True)
+            print(f"  Dedicated Tree-sitter JSON -> {per_doc_json.name}", flush=True)
+            print(f"{sep}\n", flush=True)
+        except Exception as e:
+            logger.debug(f"Doc Tree-sitter logging notice: {e}")
+
         return {
             "success": True,
             "file_id": file_id,
@@ -398,7 +511,15 @@ class CodeDocIngestionService:
 
     @classmethod
     def list_staging_queue(cls, status: str = "pending_review") -> List[Dict[str, Any]]:
-        """Returns all functions currently waiting in the Staging Queue for human review"""
+        """
+        Returns all functions currently waiting in the Staging Queue for human review.
+
+        Args:
+            status: Verification status filter ('pending_review', 'verified', 'rejected').
+
+        Returns:
+            List of function dictionaries with parent conflict comparisons.
+        """
         with db_service.get_session() as session:
             records = (
                 session.query(FunctionRecord)
@@ -410,7 +531,6 @@ class CodeDocIngestionService:
             result = []
             for r in records:
                 item = r.to_dict()
-                # Attach parent/conflict comparison if conflict exists
                 if r.parent_function_id:
                     parent = session.query(FunctionRecord).filter_by(id=r.parent_function_id).first()
                     if parent:
@@ -434,9 +554,18 @@ class CodeDocIngestionService:
     ) -> Dict[str, Any]:
         """
         Human Verification Action: Approves a staged function.
+
         1. Updates verification_status to 'verified'.
         2. Upserts into ChromaDB so it becomes immediately searchable in chat.
-        3. If it updates an existing parent function, preserves audit trail.
+        3. Preserves audit history.
+
+        Args:
+            function_id: Primary key id of the FunctionRecord.
+            approved_version: Optional version override by the reviewer.
+            notes: Verification notes or approval rationale.
+
+        Returns:
+            Dict indicating approval and vector store sync status.
         """
         with db_service.get_session() as session:
             func = session.query(FunctionRecord).filter_by(id=function_id).first()
@@ -450,11 +579,10 @@ class CodeDocIngestionService:
                 func.additional_metadata = f"{func.additional_metadata or ''} | Verified by Admin: {notes}".strip(" |")
             func.updated_at = datetime.datetime.utcnow()
 
-            # Prepare dict for ChromaDB upsert
             f_dict = func.to_dict()
             session.commit()
 
-        # Upsert into ChromaDB vector store
+        # Synchronize into ChromaDB vector store
         try:
             chroma_service.upsert_function(
                 mysql_id=f_dict["id"],
@@ -484,7 +612,16 @@ class CodeDocIngestionService:
 
     @classmethod
     def reject_staged_function(cls, function_id: int, reason: Optional[str] = None) -> Dict[str, Any]:
-        """Human Verification Action: Rejects a staged function (never enters ChromaDB)"""
+        """
+        Human Verification Action: Rejects a staged function (never enters ChromaDB).
+
+        Args:
+            function_id: Primary key id of the FunctionRecord.
+            reason: Rejection reason entered by the reviewer.
+
+        Returns:
+            Dict indicating rejection status.
+        """
         with db_service.get_session() as session:
             func = session.query(FunctionRecord).filter_by(id=function_id).first()
             if not func:
@@ -512,7 +649,20 @@ class CodeDocIngestionService:
         params: List[str],
         author_notes: Optional[str] = None
     ) -> str:
-        """Uses Gemini to generate concise business context for an extracted code unit"""
+        """
+        Uses Gemini to generate concise business context for an extracted code unit.
+
+        Args:
+            fn_name: Extracted function identifier.
+            code_snippet: Source code snippet.
+            language: Programming language.
+            complexity: Cyclomatic complexity metric.
+            params: Function parameter list.
+            author_notes: Optional user context.
+
+        Returns:
+            Concise 1-2 sentence business purpose summary.
+        """
         prompt = (
             f"You are DevKnow Code Intelligence. In 1 or 2 concise sentences, summarize the purpose "
             f"and business logic of this {language} function for an enterprise developer knowledge base:\n\n"
@@ -535,7 +685,19 @@ class CodeDocIngestionService:
 
     @staticmethod
     def _increment_version(ver_str: str) -> str:
-        """Increments version string (e.g. 1.0.0 -> 1.1.0 or 1.0 -> 1.1)"""
+        """
+        Increments the minor or patch version of a semantic version string.
+
+        Examples:
+            '1.0.0' -> '1.1.0'
+            'v1.0'  -> '1.1'
+
+        Args:
+            ver_str: Current version string.
+
+        Returns:
+            Incremented version string.
+        """
         parts = ver_str.replace("v", "").split(".")
         if len(parts) >= 2 and parts[1].isdigit():
             parts[1] = str(int(parts[1]) + 1)

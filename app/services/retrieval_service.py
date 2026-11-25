@@ -1,3 +1,23 @@
+"""
+Retrieval & RAG Orchestration Service Module for DevKnow.
+
+Coordinates the end-to-end Retrieval-Augmented Generation (RAG) workflow:
+1. Query Routing & Security Screening: Invokes QueryRouter to detect injection attacks,
+   out-of-scope non-technical queries, and extract language filters.
+2. Vector Retrieval: Queries ChromaDB vector store for candidate functions matching
+   the user query above the configurable similarity threshold.
+3. Grounding Verification & Desync Detection: Queries relational database (MySQL/SQLite)
+   to ensure candidates are verified and still exist. Identifies database drift
+   and prevents hallucinated attribution.
+4. Static Tree-sitter Code Inspection: Computes deterministic compiler metrics
+   (parameters, return types, cyclomatic complexity, syntax validity) on attached or
+   retrieved code snippets.
+5. Grounding & Attribution Computation: Calculates verified percentage split between
+   organizational knowledge base and general LLM synthesis.
+6. Multi-step Reasoning Disclosure: Assembles real-time "thinking steps" explaining
+   the AI's internal decision pipeline to users in the chat UI.
+"""
+
 import time
 import json
 import logging
@@ -23,10 +43,25 @@ from app.rag.prompts import (
 
 logger = logging.getLogger("DevKnow.RAG")
 
+
 class RetrievalService:
+    """
+    Core RAG orchestration service linking semantic search, relational verification,
+    AST static analysis, and prompt generation.
+    """
+
     @staticmethod
     def get_conversation_history(session_id: str, limit: int = 10) -> str:
-        """Retrieves last N turns of conversation history for the session"""
+        """
+        Retrieves the last N conversation turns for context-aware multi-turn dialogue.
+
+        Args:
+            session_id: Unique chat session UUID.
+            limit: Maximum number of previous message pairs to retrieve.
+
+        Returns:
+            str: Formatted conversation history string or 'None'.
+        """
         with db_service.get_session() as session:
             conv = session.query(Conversation).filter_by(session_id=session_id).first()
             if not conv:
@@ -55,23 +90,40 @@ class RetrievalService:
         attached_code: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Executes end-to-end RAG workflow:
-        Routing -> Vector Search -> Threshold Check -> MySQL Fetch -> Prompt Prep
-        Returns: {
-            "source": "kb_hit" | "llm_fallback",
-            "intent": str,
-            "max_score": float,
-            "retrieved_functions": list,
-            "prompt": str,
-            "execution_metadata": dict
-        }
+        Executes the end-to-end RAG pipeline for a user message.
+
+        Workflow:
+        1. Query Routing: Detects adversarial injection, out-of-scope queries, and language filters.
+        2. Vector Search: Finds top-K candidate embeddings in ChromaDB.
+        3. Database Grounding: Verifies candidate functions exist in MySQL with `verified` status.
+           Enforces strict anti-drift logging if ChromaDB has orphaned vector IDs.
+        4. Static Code Inspection: Runs Tree-sitter on attached or retrieved code for complexity & smells.
+        5. Prompt Assembly: Selects specialized prompt template (Hit, Miss, Conversion, Refusal).
+        6. Attribution & Reasoning: Computes grounding percentages and UI reasoning disclosure steps.
+
+        Args:
+            query: The user's natural language question or instruction.
+            session_id: Active session UUID for multi-turn history.
+            selected_language: Optional language filter selected in the chat UI.
+            attached_code: Optional code snippet attached with the message.
+
+        Returns:
+            Dict containing:
+            - `source`: 'kb_hit' | 'llm_fallback' | 'security_blocked' | 'guardrail_blocked'
+            - `intent`: Classified query intent string.
+            - `max_score`: Peak semantic similarity score (0.0 to 1.0).
+            - `retrieved_functions`: List of verified function dictionaries.
+            - `prompt`: Fully assembled prompt ready for LLM generation.
+            - `thinking_steps`: List of reasoning explanation steps for the UI.
+            - `grounding_stats`: Percentage attribution between KB and LLM.
+            - `execution_metadata`: Detailed audit trail and latency metrics.
         """
         start_time = time.time()
 
         # Step 1: Query Routing & Security Inspection
         routing = QueryRouter.route_query(
-            query, 
-            user_selected_language=selected_language, 
+            query,
+            user_selected_language=selected_language,
             attached_code=attached_code
         )
         intent = routing["intent"]
@@ -81,7 +133,7 @@ class RetrievalService:
         is_out_of_scope = intent == "out_of_scope"
 
         # Step 2: Vector Search in ChromaDB (Bypassed if prompt_injection or out_of_scope)
-        retrieved_functions = []
+        retrieved_functions: List[Dict[str, Any]] = []
         context_functions_str = ""
 
         if is_security_blocked or is_out_of_scope:
@@ -101,7 +153,7 @@ class RetrievalService:
 
             max_score = vector_matches[0]["similarity"] if vector_matches else 0.0
             has_potential_match = len(vector_matches) > 0 and max_score >= Config.SIMILARITY_THRESHOLD
-            missing_ids = []
+            missing_ids: List[int] = []
             drift_detected = False
 
             # Step 3: Fetch exact original code from MySQL if vector match >= threshold
@@ -126,26 +178,23 @@ class RetrievalService:
                 missing_ids = [m_id for m_id in mysql_ids if m_id not in record_map]
                 drift_detected = len(missing_ids) > 0
 
-                # ── EXPLICIT AUDIT LOGGING FOR DATABASE DRIFT / EMPTY MYSQL MATCHES ──
+                # Explicit Audit Logging for Database Drift / Orphaned ChromaDB Matches
                 if not retrieved_functions:
-                    # ChromaDB returned vector match(es) >= threshold, but MySQL has NO matching rows
                     logger.error(
                         f"[RAG AUDIT: COMPLETE DATABASE DRIFT] "
-                        f"ChromaDB returned {len(vector_matches)} candidate vector(s) (candidate IDs: {mysql_ids}, top_similarity: {round(max_score, 4)}), "
-                        f"but MySQL returned EMPTY (0 records found in 'functions' table). "
+                        f"ChromaDB returned {len(vector_matches)} candidate vector(s) (IDs: {mysql_ids}, top_similarity: {round(max_score, 4)}), "
+                        f"but MySQL returned EMPTY (0 records in 'functions' table). "
                         f"User Query: '{query[:150]}' | Session: '{session_id}'. "
-                        f"Action Taken: Denied KB grounding. Forcing source='llm_fallback' with 0% KB attribution to prevent phantom hallucination. "
-                        f"Root Cause: Orphaned vector embeddings in ChromaDB without matching relational rows. "
-                        f"Remediation: Run POST /api/knowledge-base/reindex or click 'Sync Search Index' in the Knowledge Base UI."
+                        f"Action: Denied KB grounding. Forcing source='llm_fallback' with 0% KB attribution. "
+                        f"Remediation: Click 'Sync Search Index' or call POST /api/knowledge-base/reindex."
                     )
                 elif missing_ids:
-                    # Some IDs were missing from MySQL while others were found
                     logger.warning(
                         f"[RAG AUDIT: PARTIAL DATABASE DRIFT] "
-                        f"ChromaDB returned candidates {mysql_ids}, but IDs {missing_ids} were NOT found in MySQL. "
+                        f"ChromaDB returned candidates {mysql_ids}, but IDs {missing_ids} were not found in MySQL. "
                         f"Retrieved {len(retrieved_functions)} verified record(s). "
                         f"User Query: '{query[:150]}' | Session: '{session_id}'. "
-                        f"Action Taken: Filtered out orphaned IDs {missing_ids} from prompt context."
+                        f"Action: Filtered out orphaned IDs {missing_ids} from prompt context."
                     )
                 else:
                     logger.info(
@@ -174,7 +223,7 @@ class RetrievalService:
             if not is_kb_hit:
                 max_score = 0.0
 
-        # Step 4: Retrieve Conversation Memory
+        # Step 4: Retrieve Conversation Memory & Static Tree-sitter Inspection
         history = cls.get_conversation_history(session_id, limit=Config.CONVERSATION_MEMORY_TURNS)
         safe_code = sanitize_prompt_input(attached_code) if attached_code else ""
         attached_code_section = ""
@@ -185,7 +234,7 @@ class RetrievalService:
                 syntax_str = "Valid Syntax" if ast_info["is_valid_syntax"] else f"Irregular ({ast_info['syntax_error']})"
                 params_str = ", ".join(ast_info["parameters"]) if ast_info["parameters"] else "None identified"
                 ast_summary = (
-                    f"### STATIC AST CODE ANALYSIS (DETERMINISTIC COMPILER METRICS):\n"
+                    f"### STATIC TREE-SITTER CODE ANALYSIS (DETERMINISTIC COMPILER METRICS):\n"
                     f"- Language: {ast_info['language']}\n"
                     f"- Identified Function: {ast_info['function_name']}\n"
                     f"- Parameters: {params_str}\n"
@@ -344,7 +393,7 @@ class RetrievalService:
                 }
             ]
 
-        # Step 7b: Run AST / Tree-sitter Code Inspection on retrieved or attached code
+        # Step 7b: Run Tree-sitter Code Inspection on retrieved or attached code
         code_to_inspect = attached_code
         if not code_to_inspect and retrieved_functions:
             fn0 = retrieved_functions[0]
@@ -362,7 +411,7 @@ class RetrievalService:
                 ast_metrics = code_parser.analyze_code_quality(code_to_inspect, inspect_lang)
                 engine_tag = ast_metrics["parser_engine"].replace("_", "-").upper()
                 thinking_steps.insert(-1, {
-                    "title": f"AST & Syntax Inspection ({engine_tag})",
+                    "title": f"Tree-sitter Syntax Inspection ({engine_tag})",
                     "detail": (
                         f"Parsed '{ast_metrics['function_name']}' | Complexity: {ast_metrics['complexity']} | "
                         f"Syntax: {'Valid' if ast_metrics['is_valid_syntax'] else 'Irregular'} | "
@@ -405,4 +454,3 @@ class RetrievalService:
             "grounding_stats": grounding_stats,
             "execution_metadata": obs_log
         }
-
