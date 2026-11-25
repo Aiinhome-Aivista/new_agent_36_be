@@ -20,44 +20,175 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 logger = logging.getLogger("DevKnow.CodeParser")
 
-# ── Dedicated AST Detail Logger (writes to data/logs/ast/ directory) ──────────
+# ── Dedicated AST Detail Logger (writes directly to data/logs/) ───────────────
 _ast_detail_logger: Optional[logging.Logger] = None
 
 def _get_ast_logger() -> logging.Logger:
     """
     Returns the dedicated AST detail file logger, creating it on first call.
-    Writes to: new_agent_36_be/data/logs/ast/ast_analysis.log
-    Uses RotatingFileHandler: 5MB per file, keeps last 5 files.
+    Writes to:
+      1. new_agent_36_be/data/logs/ast_extraction.log (main logs directory)
+      2. new_agent_36_be/data/logs/ast/ast_analysis.log (backward compatibility)
+    Uses RotatingFileHandler: 10MB per file, keeps last 5 files.
     """
     global _ast_detail_logger
     if _ast_detail_logger is not None:
         return _ast_detail_logger
 
-    # Build the path:  <backend_root>/data/logs/ast/
     base_dir = Path(__file__).resolve().parent.parent.parent  # → new_agent_36_be/
-    ast_log_dir = base_dir / "data" / "logs" / "ast"
-    ast_log_dir.mkdir(parents=True, exist_ok=True)
+    main_logs_dir = base_dir / "data" / "logs"
+    main_logs_dir.mkdir(parents=True, exist_ok=True)
+    ast_subdir = main_logs_dir / "ast"
+    ast_subdir.mkdir(parents=True, exist_ok=True)
 
     _ast_detail_logger = logging.getLogger("DevKnow.AST.Detail")
     _ast_detail_logger.setLevel(logging.DEBUG)
     _ast_detail_logger.propagate = False   # Don't bubble up to root logger
 
     if not _ast_detail_logger.handlers:
-        log_file = ast_log_dir / "ast_analysis.log"
-        handler = RotatingFileHandler(
-            str(log_file),
-            maxBytes=5 * 1024 * 1024,   # 5 MB per file
+        formatter = logging.Formatter(
+            "[%(asctime)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"
+        )
+        # Primary log file in data/logs/
+        main_log_file = main_logs_dir / "ast_extraction.log"
+        h1 = RotatingFileHandler(
+            str(main_log_file),
+            maxBytes=10 * 1024 * 1024,   # 10 MB per file
             backupCount=5,
             encoding="utf-8"
         )
-        handler.setFormatter(logging.Formatter(
-            "[%(asctime)s] %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        ))
-        _ast_detail_logger.addHandler(handler)
-        logger.info(f"AST detail logger initialized → {log_file}")
+        h1.setFormatter(formatter)
+        _ast_detail_logger.addHandler(h1)
+
+        # Mirror file in data/logs/ast/ for backwards compatibility
+        mirror_file = ast_subdir / "ast_analysis.log"
+        h2 = RotatingFileHandler(
+            str(mirror_file),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8"
+        )
+        h2.setFormatter(formatter)
+        _ast_detail_logger.addHandler(h2)
+
+        logger.info(f"AST detail logger initialized → {main_log_file}")
 
     return _ast_detail_logger
+
+
+def _write_extraction_logs(
+    results: List[Dict[str, Any]],
+    language: str,
+    filename: Optional[str] = None,
+    parser_engine: str = "Tree-sitter"
+) -> Dict[str, Path]:
+    """
+    Writes rich structured extraction logs directly into data/logs/ folder:
+    1. Appends full audit entry to data/logs/ast_extraction.log
+    2. Overwrites latest JSON report at data/logs/ast_extracted_functions.json
+    3. If filename provided, creates dedicated per-upload log:
+       data/logs/ast_upload_<filename>.log and timestamped copy
+    4. Mirrors to data/logs/ast/ directory for backward compatibility.
+    """
+    base_dir = Path(__file__).resolve().parent.parent.parent
+    main_logs_dir = base_dir / "data" / "logs"
+    main_logs_dir.mkdir(parents=True, exist_ok=True)
+    ast_subdir = main_logs_dir / "ast"
+    ast_subdir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts_compact = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    file_display = filename or "unnamed_source_code"
+
+    sep = "=" * 80
+    summary_lines = []
+    for i, r in enumerate(results):
+        summary_lines.append(
+            f"  [{i+1}] {r.get('function_name', 'unnamed')} | "
+            f"Lines {r.get('start_line', '?')}-{r.get('end_line', '?')} | "
+            f"Complexity: {r.get('complexity', 1)} | "
+            f"Params: {r.get('parameters', [])} | "
+            f"Return: '{r.get('return_type', '')}' | "
+            f"Async: {r.get('is_async', False)}"
+        )
+
+    log_entry = (
+        f"\n{sep}\n"
+        f"TIMESTAMP          : {timestamp}\n"
+        f"EVENT              : PROGRAM FILE FUNCTION EXTRACTION (TREE-SITTER)\n"
+        f"SOURCE FILE        : {file_display}\n"
+        f"LANGUAGE           : {language}\n"
+        f"PARSER ENGINE      : {parser_engine}\n"
+        f"TOTAL FUNCTIONS    : {len(results)}\n"
+        f"FUNCTIONS EXTRACTED:\n" +
+        ("\n".join(summary_lines) if summary_lines else "  No functions identified") +
+        f"\n{sep}\n"
+    )
+
+    # 1. Append to primary ast_extraction.log
+    al = _get_ast_logger()
+    al.info(log_entry)
+
+    # 2. Save JSON reports
+    report_data = {
+        "timestamp": timestamp,
+        "event": "program_file_function_extraction",
+        "file_name": file_display,
+        "language": language,
+        "parser_engine": parser_engine,
+        "total_functions": len(results),
+        "functions": results
+    }
+    json_str = json.dumps(report_data, indent=2)
+
+    # Write in main data/logs/
+    main_json = main_logs_dir / "ast_extracted_functions.json"
+    main_json.write_text(json_str, encoding="utf-8")
+
+    # Mirror in data/logs/ast/
+    sub_json = ast_subdir / "ast_extracted_functions.json"
+    sub_json.write_text(json_str, encoding="utf-8")
+    (ast_subdir / f"ast_report_{ts_compact}.json").write_text(json_str, encoding="utf-8")
+
+    written_paths = {"main_log": main_logs_dir / "ast_extraction.log", "main_json": main_json}
+
+    # 3. Dedicated per-file upload log if filename is provided
+    if filename:
+        safe_fname = re.sub(r'[^a-zA-Z0-9_\.-]', '_', Path(filename).name)
+        per_file_log = main_logs_dir / f"ast_upload_{safe_fname}.log"
+        ts_per_file_log = main_logs_dir / f"ast_upload_{ts_compact}_{safe_fname}.log"
+
+        file_specific_content = (
+            f"{sep}\n"
+            f"DEV-KNOW AST INTELLIGENCE - PROGRAM FILE UPLOAD EXTRACTION LOG\n"
+            f"{sep}\n"
+            f"Uploaded File     : {filename}\n"
+            f"Timestamp         : {timestamp}\n"
+            f"Detected Language : {language}\n"
+            f"Parser Engine     : {parser_engine}\n"
+            f"Extracted Count   : {len(results)} function(s)\n"
+            f"{sep}\n\n"
+            f"EXTRACTED FUNCTION DETAILS:\n"
+        )
+        for i, r in enumerate(results):
+            file_specific_content += (
+                f"\n--- Function #{i+1}: {r.get('function_name')} ---\n"
+                f"  Header     : {r.get('function_header', '').strip()}\n"
+                f"  Line Range : Lines {r.get('start_line')}-{r.get('end_line')}\n"
+                f"  Parameters : {r.get('parameters', [])}\n"
+                f"  Return Type: {r.get('return_type', 'None specified')}\n"
+                f"  Complexity : {r.get('complexity', 1)}\n"
+                f"  Async      : {r.get('is_async', False)}\n"
+                f"  Code:\n{textwrap.indent(r.get('full_code', ''), '    ')}\n"
+            )
+        file_specific_content += f"\n{sep}\n[END OF EXTRACTION REPORT]\n{sep}\n"
+
+        per_file_log.write_text(file_specific_content, encoding="utf-8")
+        ts_per_file_log.write_text(file_specific_content, encoding="utf-8")
+        written_paths["upload_log"] = per_file_log
+
+    return written_paths
 
 
 def _log_ast_result(
@@ -109,13 +240,14 @@ def _log_ast_result(
         f"{separator}\n"
     )
 
-    # Also write standalone JSON file and print to terminal
+    # Write latest analysis JSON file in both data/logs/ and data/logs/ast/
     try:
         base_dir = Path(__file__).resolve().parent.parent.parent
-        ast_dir = base_dir / "data" / "logs" / "ast"
+        main_logs_dir = base_dir / "data" / "logs"
+        ast_dir = main_logs_dir / "ast"
         ast_dir.mkdir(parents=True, exist_ok=True)
-        latest_analysis_file = ast_dir / "ast_latest_analysis.json"
-        latest_analysis_file.write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        (main_logs_dir / "ast_latest_analysis.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
+        (ast_dir / "ast_latest_analysis.json").write_text(json.dumps(entry, indent=2), encoding="utf-8")
 
         print(
             f"🌳 [AST Inspection] {result.get('parser_engine', 'AST').upper()}: "
@@ -134,8 +266,8 @@ _TREE_SITTER_AVAILABLE = False
 
 try:
     from tree_sitter_languages import get_parser  # type: ignore[import-untyped, import-not-found]
-    # Pre-cache parsers
-    for lang_key in ["c_sharp", "javascript", "typescript", "python"]:
+    # Pre-cache parsers for all supported languages
+    for lang_key in ["python", "c_sharp", "javascript", "typescript", "java", "go", "cpp", "c"]:
         try:
             _PARSERS[lang_key] = get_parser(lang_key)
         except Exception as e:
@@ -148,7 +280,7 @@ except (ImportError, Exception) as ts_err:
 class CodeParserService:
     """
     Centralized code parsing and static AST analysis engine.
-    Combines native Python AST with Tree-sitter for multi-language intelligence.
+    Combines Tree-sitter and native Python AST for multi-language intelligence.
     """
 
     @classmethod
@@ -159,12 +291,20 @@ class CodeParserService:
         l = lang.strip().lower()
         if l in ("c#", "csharp", "cs"):
             return "c_sharp"
-        if l in ("js", "javascript"):
+        if l in ("js", "javascript", "jsx", "mjs", "cjs"):
             return "javascript"
-        if l in ("ts", "typescript"):
+        if l in ("ts", "typescript", "tsx"):
             return "typescript"
         if l in ("py", "python"):
             return "python"
+        if l in ("java",):
+            return "java"
+        if l in ("go", "golang"):
+            return "go"
+        if l in ("cpp", "c++", "cplusplus", "cc", "hpp"):
+            return "cpp"
+        if l in ("c", "h"):
+            return "c"
         return l
 
     @classmethod
@@ -172,6 +312,7 @@ class CodeParserService:
         """
         Extracts function name, parameters, return type, and async status
         using Tree-sitter or Python AST, with graceful regex fallback.
+        Prioritizes Tree-sitter for multi-language deterministic extraction.
         """
         if not code or not code.strip():
             return {
@@ -185,17 +326,17 @@ class CodeParserService:
 
         norm_lang = cls.normalize_language(language)
 
-        # 1. Native Python AST for Python code
+        # 1. Tree-sitter for all supported languages
+        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
+            ts_meta = cls._parse_tree_sitter(code, norm_lang)
+            if ts_meta and ts_meta.get("function_name") and ts_meta.get("function_name") != "unnamed_function":
+                return ts_meta
+
+        # 2. Native Python AST for Python code
         if norm_lang == "python":
             py_meta = cls._parse_python_ast(code)
             if py_meta and py_meta.get("function_name"):
                 return py_meta
-
-        # 2. Tree-sitter for C#, TypeScript, JavaScript, Python
-        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
-            ts_meta = cls._parse_tree_sitter(code, norm_lang)
-            if ts_meta and ts_meta.get("function_name"):
-                return ts_meta
 
         # 3. Fallback to Regex
         return cls._fallback_regex_parse(code, norm_lang)
@@ -224,7 +365,7 @@ class CodeParserService:
 
     @classmethod
     def _parse_tree_sitter(cls, code: str, norm_lang: str) -> Optional[Dict[str, Any]]:
-        """Parses code using Tree-sitter across C#, JS, TS, and Python"""
+        """Parses single function/method code using Tree-sitter across C#, JS, TS, Python, Java, Go, C++"""
         parser = _PARSERS.get(norm_lang)
         if not parser:
             return None
@@ -240,21 +381,24 @@ class CodeParserService:
             params = []
             is_async = False
 
+            # Recognized function node types across Tree-sitter grammars
+            func_types = (
+                "method_declaration",
+                "local_function_statement",
+                "constructor_declaration",
+                "function_declaration",
+                "function_expression",
+                "arrow_function",
+                "function_definition",
+                "method_definition",
+                "generator_function_declaration"
+            )
+
             # Walk AST to find function/method declaration
             def find_func_node(node):
                 nonlocal target_node
                 if target_node:
                     return
-                # Recognized function node types across Tree-sitter grammars
-                func_types = (
-                    "method_declaration",
-                    "local_function_statement",
-                    "function_declaration",
-                    "function_expression",
-                    "arrow_function",
-                    "function_definition",
-                    "method_definition"
-                )
                 if node.type in func_types:
                     target_node = node
                     return
@@ -273,27 +417,49 @@ class CodeParserService:
                             break
 
             if target_node:
-                # Name
+                # 1. Resolve Function Name
                 name_node = target_node.child_by_field_name("name")
                 if name_node:
                     fn_name = name_node.text.decode("utf-8")
+                elif target_node.parent and target_node.parent.type in ("variable_declarator", "lexical_binding"):
+                    vn = target_node.parent.child_by_field_name("name")
+                    if vn:
+                        fn_name = vn.text.decode("utf-8")
+                elif target_node.parent and target_node.parent.type == "assignment_expression":
+                    left = target_node.parent.child_by_field_name("left")
+                    if left:
+                        fn_name = left.text.decode("utf-8")
+                elif target_node.parent and target_node.parent.type == "pair":
+                    key = target_node.parent.child_by_field_name("key")
+                    if key:
+                        fn_name = key.text.decode("utf-8")
 
-                # Return Type
-                type_node = target_node.child_by_field_name("type") or target_node.child_by_field_name("return_type")
-                if type_node:
-                    ret_type = type_node.text.decode("utf-8").lstrip(": ").strip()
+                # C/C++ declarator resolution
+                if not fn_name:
+                    decl_node = target_node.child_by_field_name("declarator")
+                    while decl_node and decl_node.type in ("function_declarator", "pointer_declarator"):
+                        decl_node = decl_node.child_by_field_name("declarator")
+                    if decl_node and decl_node.type == "identifier":
+                        fn_name = decl_node.text.decode("utf-8")
 
-                # Parameters
+                # 2. Return Type
+                for rf in ("type", "return_type", "result"):
+                    type_node = target_node.child_by_field_name(rf)
+                    if type_node:
+                        ret_type = type_node.text.decode("utf-8").lstrip(": ").strip()
+                        break
+
+                # 3. Parameters
                 params_node = target_node.child_by_field_name("parameters")
                 if params_node:
                     for p in params_node.children:
-                        if p.type in ("parameter", "identifier", "required_parameter", "optional_parameter"):
-                            p_text = p.text.decode("utf-8").strip()
-                            if p_text and p_text not in (",", "(", ")"):
-                                params.append(p_text)
+                        p_text = p.text.decode("utf-8").strip()
+                        if p_text and p_text not in (",", "(", ")"):
+                            params.append(p_text)
 
-                # Async check
-                if "async" in target_node.text.decode("utf-8")[:30].lower():
+                # 4. Async check
+                first_slice = target_node.text.decode("utf-8")[:40].lower()
+                if "async" in first_slice:
                     is_async = True
 
                 complexity = cls._calculate_tree_sitter_complexity(target_node)
@@ -501,19 +667,139 @@ class CodeParserService:
         return result
 
     @classmethod
-    def extract_all_functions(cls, code: str, language: Optional[str] = None) -> List[Dict[str, Any]]:
+    def extract_all_functions(
+        cls,
+        code: str,
+        language: Optional[str] = None,
+        filename: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
-        Parses an entire source code file (e.g. .cs, .ts, .js, .py)
-        and extracts every function/method as a distinct, atomic chunk.
+        Parses an entire source code file (.py, .cs, .ts, .js, .jsx, .tsx, .java, .go, .cpp, .c)
+        using Tree-sitter to deterministically extract every function/method.
+        Directly saves structured extraction logs into data/logs/ folder.
         """
         if not code or not code.strip():
             return []
 
         norm_lang = cls.normalize_language(language)
         results = []
+        parser_used = "none"
 
-        # 1. Native Python AST for Python files
-        if norm_lang == "python":
+        # 1. Tree-sitter AST extraction (Primary Engine across all languages)
+        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
+            try:
+                parser = _PARSERS[norm_lang]
+                code_bytes = code.encode("utf-8")
+                tree = parser.parse(code_bytes)
+                lines = code.split("\n")
+
+                func_types = (
+                    "method_declaration",
+                    "local_function_statement",
+                    "constructor_declaration",
+                    "function_declaration",
+                    "function_expression",
+                    "arrow_function",
+                    "function_definition",
+                    "method_definition",
+                    "generator_function_declaration"
+                )
+
+                found_nodes = []
+                def collect_nodes(n):
+                    if n.type in func_types:
+                        found_nodes.append(n)
+                    for child in n.children:
+                        collect_nodes(child)
+
+                collect_nodes(tree.root_node)
+
+                for node in found_nodes:
+                    # 1. Function Name Extraction
+                    fn_name = ""
+                    name_node = node.child_by_field_name("name")
+                    if name_node:
+                        fn_name = name_node.text.decode("utf-8")
+                    elif node.parent and node.parent.type in ("variable_declarator", "lexical_binding"):
+                        vn = node.parent.child_by_field_name("name")
+                        if vn:
+                            fn_name = vn.text.decode("utf-8")
+                    elif node.parent and node.parent.type == "assignment_expression":
+                        left = node.parent.child_by_field_name("left")
+                        if left:
+                            fn_name = left.text.decode("utf-8")
+                    elif node.parent and node.parent.type == "pair":
+                        key = node.parent.child_by_field_name("key")
+                        if key:
+                            fn_name = key.text.decode("utf-8")
+
+                    # C / C++ Declarator identifier
+                    if not fn_name:
+                        decl = node.child_by_field_name("declarator")
+                        while decl and decl.type in ("function_declarator", "pointer_declarator"):
+                            decl = decl.child_by_field_name("declarator")
+                        if decl and decl.type == "identifier":
+                            fn_name = decl.text.decode("utf-8")
+
+                    # If still unnamed, provide clean identifiable placeholder
+                    if not fn_name:
+                        fn_name = f"anonymous_fn_L{node.start_point[0] + 1}"
+
+                    # 2. Return Type
+                    ret_type = ""
+                    for rf in ("type", "return_type", "result"):
+                        type_node = node.child_by_field_name(rf)
+                        if type_node:
+                            ret_type = type_node.text.decode("utf-8").lstrip(": ").strip()
+                            break
+
+                    # 3. Parameters
+                    params = []
+                    params_node = node.child_by_field_name("parameters")
+                    if params_node:
+                        for p in params_node.children:
+                            if p.type in ("parameter", "identifier", "required_parameter", "optional_parameter",
+                                          "default_parameter", "typed_parameter", "typed_default_parameter",
+                                          "formal_parameters"):
+                                p_text = p.text.decode("utf-8").strip()
+                                if p_text and p_text not in (",", "(", ")"):
+                                    params.append(p_text)
+
+                    # 4. Line Range & Code
+                    start_line = node.start_point[0] + 1
+                    end_line = node.end_point[0] + 1
+                    fn_lines = lines[start_line - 1 : end_line]
+                    fn_full = "\n".join(fn_lines)
+                    header = lines[start_line - 1].strip()
+                    body = "\n".join(lines[start_line : end_line]) if len(lines) > start_line else fn_full
+                    complexity = cls._calculate_tree_sitter_complexity(node)
+
+                    # 5. Async check
+                    is_async = "async" in node.text.decode("utf-8")[:40].lower()
+
+                    results.append({
+                        "function_name": fn_name,
+                        "function_header": header,
+                        "function_body": body,
+                        "full_code": fn_full,
+                        "parameters": params,
+                        "return_type": ret_type,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "complexity": complexity,
+                        "is_async": is_async,
+                        "language": norm_lang,
+                        "parser_engine": "tree-sitter"
+                    })
+
+                if results:
+                    parser_used = "tree-sitter"
+
+            except Exception as ts_err:
+                logger.debug(f"Tree-sitter full file extraction notice: {ts_err}")
+
+        # 2. Fallback to Native Python AST for Python files
+        if not results and norm_lang == "python":
             try:
                 tree = ast.parse(code)
                 lines = code.split("\n")
@@ -538,132 +824,63 @@ class CodeParserService:
                             "start_line": start_line,
                             "end_line": end_line,
                             "complexity": complexity,
-                            "language": "python"
+                            "is_async": isinstance(node, ast.AsyncFunctionDef),
+                            "language": "python",
+                            "parser_engine": "python-ast"
                         })
+                if results:
+                    parser_used = "python-ast"
             except Exception as pe:
-                logger.debug(f"Python full-file AST notice: {pe}")
+                logger.debug(f"Python full-file AST fallback notice: {pe}")
 
-        # 2. Tree-sitter for C#, TypeScript, JavaScript (or Python fallback)
-        if not results and _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
-            try:
-                parser = _PARSERS[norm_lang]
-                code_bytes = code.encode("utf-8")
-                tree = parser.parse(code_bytes)
+        # 3. Fallback to Regex if AST failed completely
+        if not results:
+            meta = cls._fallback_regex_parse(code, norm_lang)
+            if meta.get("function_name") and meta["function_name"] != "unnamed_function":
                 lines = code.split("\n")
+                results.append({
+                    "function_name": meta["function_name"],
+                    "function_header": lines[0].strip()[:150],
+                    "function_body": code.strip(),
+                    "full_code": code.strip(),
+                    "parameters": meta.get("parameters", []),
+                    "return_type": meta.get("return_type", ""),
+                    "start_line": 1,
+                    "end_line": len(lines),
+                    "complexity": meta.get("complexity", 1),
+                    "is_async": meta.get("is_async", False),
+                    "language": norm_lang,
+                    "parser_engine": "regex_fallback"
+                })
+                parser_used = "regex_fallback"
 
-                func_types = (
-                    "method_declaration",
-                    "local_function_statement",
-                    "function_declaration",
-                    "function_expression",
-                    "arrow_function",
-                    "function_definition",
-                    "method_definition"
-                )
-
-                found_nodes = []
-                def collect_nodes(n):
-                    if n.type in func_types:
-                        found_nodes.append(n)
-                    for child in n.children:
-                        collect_nodes(child)
-
-                collect_nodes(tree.root_node)
-
-                for node in found_nodes:
-                    name_node = node.child_by_field_name("name")
-                    fn_name = name_node.text.decode("utf-8") if name_node else "unnamed_function"
-
-                    type_node = node.child_by_field_name("type") or node.child_by_field_name("return_type")
-                    ret_type = type_node.text.decode("utf-8").lstrip(": ").strip() if type_node else ""
-
-                    params = []
-                    params_node = node.child_by_field_name("parameters")
-                    if params_node:
-                        for p in params_node.children:
-                            if p.type in ("parameter", "identifier", "required_parameter", "optional_parameter"):
-                                p_text = p.text.decode("utf-8").strip()
-                                if p_text and p_text not in (",", "(", ")"):
-                                    params.append(p_text)
-
-                    start_line = node.start_point[0] + 1
-                    end_line = node.end_point[0] + 1
-                    fn_lines = lines[start_line - 1 : end_line]
-                    fn_full = "\n".join(fn_lines)
-                    header = lines[start_line - 1].strip()
-                    body = "\n".join(lines[start_line : end_line]) if len(lines) > start_line else fn_full
-                    complexity = cls._calculate_tree_sitter_complexity(node)
-
-                    results.append({
-                        "function_name": fn_name,
-                        "function_header": header,
-                        "function_body": body,
-                        "full_code": fn_full,
-                        "parameters": params,
-                        "return_type": ret_type,
-                        "start_line": start_line,
-                        "end_line": end_line,
-                        "complexity": complexity,
-                        "language": norm_lang
-                    })
-
-            except Exception as ts_err:
-                logger.debug(f"Tree-sitter file extraction notice: {ts_err}")
-
-        # ── Always write log entry and generate standalone AST JSON file ──────────
+        # ── Write rich structured logs directly into data/logs/ ───────────────
         try:
-            al = _get_ast_logger()
-            sep = "=" * 80
-            summary_lines = [
-                f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
-                f"| complexity {r.get('complexity')} | params: {r.get('parameters')} | return: '{r.get('return_type', '')}'"
-                for i, r in enumerate(results)
-            ]
-            log_msg = (
-                f"\n{sep}\n"
-                f"PHASE                  : extract_all_functions\n"
-                f"LANGUAGE               : {norm_lang}\n"
-                f"TOTAL FUNCTIONS FOUND  : {len(results)}\n"
-                f"FUNCTIONS EXTRACTED:\n" +
-                ("\n".join(summary_lines) if summary_lines else "  None identified") +
-                f"\n{sep}\n"
+            written_paths = _write_extraction_logs(
+                results=results,
+                language=norm_lang,
+                filename=filename,
+                parser_engine=parser_used
             )
-            al.info(log_msg)
 
-            # Also print directly to terminal console so developer sees it in real time
+            sep = "=" * 80
             print(f"\n{sep}", flush=True)
-            print(f"🌳 [AST Engine] Full File Extraction Complete ({norm_lang.upper()}):", flush=True)
-            print(f"• Total Functions Discovered: {len(results)}", flush=True)
-            for sl in summary_lines:
-                print(sl, flush=True)
-
-            # Generate standalone AST JSON file in data/logs/ast/
-            base_dir = Path(__file__).resolve().parent.parent.parent
-            ast_dir = base_dir / "data" / "logs" / "ast"
-            ast_dir.mkdir(parents=True, exist_ok=True)
-
-            ast_report = {
-                "generated_at": datetime.utcnow().isoformat() + "Z",
-                "phase": "extract_all_functions",
-                "language": norm_lang,
-                "total_functions": len(results),
-                "functions": results
-            }
-
-            # 1. Always update latest file
-            latest_file = ast_dir / "ast_extracted_functions.json"
-            latest_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
-
-            # 2. Write timestamped audit file
-            ts_str = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            ts_file = ast_dir / f"ast_report_{ts_str}.json"
-            ts_file.write_text(json.dumps(ast_report, indent=2), encoding="utf-8")
-
-            print(f"📁 AST Report File Generated -> {latest_file}", flush=True)
+            print(f"🌳 [Tree-sitter AST Engine] File Extraction Complete ({norm_lang.upper()}):", flush=True)
+            print(f"• Source File: {filename or 'In-Memory Code'}", flush=True)
+            print(f"• Parser Used: {parser_used}", flush=True)
+            print(f"• Total Functions Extracted: {len(results)}", flush=True)
+            for i, r in enumerate(results[:5]):
+                print(f"  [{i+1}] {r['function_name']} | lines {r.get('start_line')}-{r.get('end_line')} "
+                      f"| complexity {r.get('complexity')} | params: {r.get('parameters')} | ret: '{r.get('return_type', '')}'", flush=True)
+            if len(results) > 5:
+                print(f"  ... and {len(results) - 5} more functions", flush=True)
+            print(f"📁 AST Extraction Log: {written_paths.get('main_log')}", flush=True)
+            if "upload_log" in written_paths:
+                print(f"📁 Dedicated Upload Log: {written_paths['upload_log']}", flush=True)
             print(f"{sep}\n", flush=True)
 
         except Exception as log_err:
-            logger.debug(f"AST logger write error (non-critical): {log_err}")
+            logger.debug(f"AST extraction log write error (non-critical): {log_err}")
 
         return results
 

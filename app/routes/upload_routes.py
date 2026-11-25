@@ -15,8 +15,10 @@ logger = logging.getLogger("DevKnow.UploadRoutes")
 @upload_bp.route("/knowledge-base/upload", methods=["POST"])
 def upload_knowledge_base():
     """
-    Handles Excel knowledge base file upload.
-    Validates file, writes to disk, runs ingestion, returns summary.
+    Handles knowledge base file upload.
+    Supports Excel runbooks (.xlsx, .xls) as well as program source code files
+    (.py, .cs, .ts, .js, .java, .go, .cpp, .c) and documentation (.md, .txt).
+    Extracts functions via Tree-sitter AST, logs to data/logs/, and returns summary.
     """
     if "file" not in request.files:
         return jsonify({"success": False, "error": "No file part in request"}), 400
@@ -25,10 +27,13 @@ def upload_knowledge_base():
     if file.filename == "":
         return jsonify({"success": False, "error": "No file selected"}), 400
 
-    if not ExcelValidator.allowed_file(file.filename):
+    is_excel = ExcelValidator.allowed_file(file.filename)
+    is_code_or_doc = CodeDocIngestionService.is_supported_file(file.filename)
+
+    if not is_excel and not is_code_or_doc:
         return jsonify({
             "success": False,
-            "error": "Invalid file extension. Only .xlsx and .xls files are supported."
+            "error": "Invalid file extension. Supported formats: .xlsx, .xls, .py, .cs, .ts, .js, .jsx, .tsx, .java, .go, .cpp, .c, .md, .txt"
         }), 400
 
     Config.ensure_directories()
@@ -40,10 +45,18 @@ def upload_knowledge_base():
         file.save(saved_path)
         logger.info(f"File saved to {saved_path}. Starting ingestion...")
 
-        summary = ExcelIngestionService.ingest_excel_file(
-            file_path=saved_path,
-            original_filename=original_filename
-        )
+        if is_excel:
+            summary = ExcelIngestionService.ingest_excel_file(
+                file_path=saved_path,
+                original_filename=original_filename
+            )
+        else:
+            author_notes = request.form.get("notes", "").strip()
+            summary = CodeDocIngestionService.ingest_code_or_doc_file(
+                file_path=saved_path,
+                original_filename=original_filename,
+                author_notes=author_notes
+            )
 
         status_code = 200 if summary.get("success") else 400
         return jsonify(summary), status_code
