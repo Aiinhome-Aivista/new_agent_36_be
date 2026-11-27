@@ -53,6 +53,7 @@ class Config:
     CHROMA_PATH = BASE_DIR / os.getenv("CHROMA_PATH", "data/chroma_db")
     LOGS_PATH = BASE_DIR / os.getenv("LOGS_PATH", "data/logs")
     TREESITTER_LOGS_PATH = LOGS_PATH / "treesitter"
+    INGESTION_LOGS_PATH = LOGS_PATH / "ingestion"
     MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", 50))
     MAX_CONTENT_LENGTH = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 
@@ -147,5 +148,6 @@ class Config:
         cls.CHROMA_PATH.mkdir(parents=True, exist_ok=True)
         cls.LOGS_PATH.mkdir(parents=True, exist_ok=True)
         cls.TREESITTER_LOGS_PATH.mkdir(parents=True, exist_ok=True)
+        cls.INGESTION_LOGS_PATH.mkdir(parents=True, exist_ok=True)
 
 

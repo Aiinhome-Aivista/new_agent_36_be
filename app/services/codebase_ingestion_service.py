@@ -37,6 +37,8 @@ from typing import Dict, Any, List, Optional
 
 from app.services.mysql_service import db_service
 from app.services.code_doc_ingestion_service import CodeDocIngestionService
+from app.services.chroma_service import chroma_service
+from app.services.ingestion_audit_logger import IngestionAuditLogger
 from app.models.database_models import CodebaseIngestionJob, KnowledgeBaseFile
 from app.config import Config
 
@@ -164,12 +166,22 @@ class CodebaseIngestionService:
                 if not job:
                     return None
                 result = job.to_dict()
-                # Parse and attach per-file breakdown if available
+                # Parse and attach per-file breakdown and audit log links if available
                 if job.result_summary:
                     try:
-                        result["file_results"] = json.loads(job.result_summary)
+                        parsed = json.loads(job.result_summary)
+                        if isinstance(parsed, dict) and "files" in parsed:
+                            result["file_results"] = parsed.get("files", [])
+                            result["audit_logs"] = parsed.get("audit_logs", {})
+                        elif isinstance(parsed, list):
+                            result["file_results"] = parsed
+                            result["audit_logs"] = {}
+                        else:
+                            result["file_results"] = []
+                            result["audit_logs"] = {}
                     except (json.JSONDecodeError, TypeError):
                         result["file_results"] = []
+                        result["audit_logs"] = {}
                 return result
         except Exception as e:
             logger.error(f"Error fetching job status for '{job_id}': {e}")
@@ -215,8 +227,17 @@ class CodebaseIngestionService:
             zip_path:     Absolute path to the uploaded zip archive.
             archive_name: Display name of the archive.
         """
+        start_time = datetime.datetime.utcnow()
+        pre_chroma_count = 0
+        try:
+            if chroma_service._collection:
+                pre_chroma_count = chroma_service._collection.count()
+        except Exception:
+            pass
+
         cls._update_job(job_id, status="processing")
         file_results: List[Dict[str, Any]] = []
+        all_staged_functions: List[Dict[str, Any]] = []
         total_staged = 0
         total_conflicts = 0
         processed = 0
@@ -293,6 +314,12 @@ class CodebaseIngestionService:
                             result_entry["status"] = "processed"
                             result_entry["functions_staged"] = functions_staged
                             result_entry["conflicts"] = conflicts
+
+                            # Accumulate function records for audit logging
+                            extracted_items = ingest_result.get("staged_functions", [])
+                            for it in extracted_items:
+                                it["source_file"] = relative_path
+                            all_staged_functions.extend(extracted_items)
                         else:
                             result_entry["status"] = "skipped"
                             result_entry["skip_reason"] = ingest_result.get("error", "No functions extracted")
@@ -313,6 +340,41 @@ class CodebaseIngestionService:
                         total_conflicts=total_conflicts,
                     )
 
+            # Audit logging: measure vector count and write dedicated logs
+            post_chroma_count = pre_chroma_count
+            try:
+                if chroma_service._collection:
+                    post_chroma_count = chroma_service._collection.count()
+            except Exception:
+                pass
+
+            chroma_stats = {
+                "collection_name": "devknow_functions",
+                "metric_space": "cosine (hnsw:space)",
+                "pre_count": pre_chroma_count,
+                "post_count": post_chroma_count,
+                "embedding_model": Config.EMBEDDING_MODEL
+            }
+            completed_time = datetime.datetime.utcnow()
+
+            # Generate dedicated audit logs for MySQL and VectorDB (Zero terminal pollution)
+            log_manifest = IngestionAuditLogger.generate_audit_logs(
+                job_id=job_id,
+                source_name=archive_name,
+                job_type="zip_upload",
+                start_time=start_time,
+                completed_at=completed_time,
+                file_results=file_results,
+                staged_functions=all_staged_functions,
+                chroma_stats=chroma_stats,
+                job_status="completed"
+            )
+
+            summary_payload = {
+                "files": file_results,
+                "audit_logs": log_manifest
+            }
+
             # Mark job completed and store per-file results summary
             cls._update_job(
                 job_id,
@@ -321,23 +383,39 @@ class CodebaseIngestionService:
                 skipped_files=skipped,
                 total_functions_staged=total_staged,
                 total_conflicts=total_conflicts,
-                completed_at=datetime.datetime.utcnow(),
-                result_summary=json.dumps(file_results),
+                completed_at=completed_time,
+                result_summary=json.dumps(summary_payload),
             )
             logger.info(
                 f"Codebase job '{job_id}' completed. "
                 f"Files: {processed} processed, {skipped} skipped. "
-                f"Functions staged: {total_staged}, Conflicts: {total_conflicts}."
+                f"Functions: {total_staged}. Audit logs: {log_manifest.get('summary_log_filename')}."
             )
 
         except Exception as fatal_err:
             logger.error(f"Codebase ingestion job '{job_id}' failed fatally: {fatal_err}")
+            completed_time = datetime.datetime.utcnow()
+            log_manifest = IngestionAuditLogger.generate_audit_logs(
+                job_id=job_id,
+                source_name=archive_name,
+                job_type="zip_upload",
+                start_time=start_time,
+                completed_at=completed_time,
+                file_results=file_results,
+                staged_functions=all_staged_functions,
+                job_status="failed",
+                error_message=str(fatal_err)
+            )
+            summary_payload = {
+                "files": file_results,
+                "audit_logs": log_manifest
+            }
             cls._update_job(
                 job_id,
                 status="failed",
                 error_message=str(fatal_err),
-                completed_at=datetime.datetime.utcnow(),
-                result_summary=json.dumps(file_results),
+                completed_at=completed_time,
+                result_summary=json.dumps(summary_payload),
             )
         finally:
             # Clean up the uploaded zip file from disk after processing
@@ -350,46 +428,356 @@ class CodebaseIngestionService:
     # ── Internal: Helpers ──────────────────────────────────────────────────
 
     @classmethod
-    def _walk_eligible_files(cls, root: Path) -> List[Path]:
+    def parse_filter_instructions(cls, instructions: str) -> Dict[str, Any]:
         """
-        Recursively walks the extracted directory and returns eligible source files.
+        Parses user comments/instructions into structured file filters.
+        NOTE: System safety blacklist (node_modules, .git, .venv, etc.) is IMMUTABLE
+        and always strictly enforced regardless of user instructions.
 
-        Applies directory-level and file-level filters to skip:
-        - Build artifacts and dependency directories (node_modules, __pycache__, etc.)
-        - Test files (test_*.py, *.test.ts, *.spec.js etc.)
-        - Files exceeding MAX_FILE_SIZE_BYTES (500 KB) to skip generated/minified bundles
-        - Unsupported extensions (images, configs, lock files etc.)
+        Examples:
+            "only read python files" -> allowed_exts: {".py"}
+            "only typescript and c#" -> allowed_exts: {".ts", ".tsx", ".cs"}
+            "services and controllers" -> path_keywords: ["service", "controller"]
+        """
+        if not instructions or not instructions.strip():
+            return {"allowed_extensions": set(SUPPORTED_EXTENSIONS), "path_keywords": []}
+
+        text = instructions.lower()
+        matched_exts = set()
+
+        if "python" in text or ".py" in text:
+            matched_exts.add(".py")
+        if "c#" in text or "csharp" in text or ".cs" in text:
+            matched_exts.add(".cs")
+        if "typescript" in text or ".ts" in text:
+            matched_exts.update([".ts", ".tsx"])
+        if "javascript" in text or ".js" in text:
+            matched_exts.update([".js", ".jsx"])
+        if "java" in text and "javascript" not in text:
+            matched_exts.add(".java")
+        if "go" in text or "golang" in text:
+            matched_exts.add(".go")
+        if "cpp" in text or "c++" in text:
+            matched_exts.update([".cpp", ".hpp"])
+        if "markdown" in text or "doc" in text or ".md" in text:
+            matched_exts.update([".md", ".txt"])
+
+        # If user explicitly specified one or more languages, restrict to them
+        allowed = matched_exts if matched_exts else set(SUPPORTED_EXTENSIONS)
+
+        # Look for path keyword hints (e.g. "service", "controller", "model", "api")
+        keywords = []
+        for kw in ["service", "controller", "model", "route", "api", "auth", "util", "helper", "handler", "repository"]:
+            if kw in text:
+                keywords.append(kw)
+
+        return {
+            "allowed_extensions": allowed,
+            "path_keywords": keywords
+        }
+
+    @classmethod
+    def submit_local_folder_job(cls, folder_path: str, user_instructions: str = "") -> Dict[str, Any]:
+        """
+        Submits an async background job to scan and ingest a local codebase folder.
+        
+        Clean code passing AST and risk validation is directly added and vectorized.
+        Quarantined code (broken syntax, secrets, severe drift) is routed to human review
+        with an elaborated negative impact analysis.
 
         Args:
-            root: Root directory path to walk.
+            folder_path: Absolute local directory path (e.g. 'C:\\Projects\\MyApp').
+            user_instructions: Optional user comments (e.g. 'only read python files').
 
         Returns:
-            List of Path objects for all eligible files.
+            Dict containing job_id, estimated_files, and status='queued'.
+        """
+        norm_path = Path(folder_path).resolve()
+        if not norm_path.exists() or not norm_path.is_dir():
+            return {
+                "success": False,
+                "error": f"Directory not found: '{folder_path}'. Please check that the path exists."
+            }
+
+        filters = cls.parse_filter_instructions(user_instructions)
+        eligible_files = cls._walk_eligible_files(norm_path, filter_config=filters)
+
+        if not eligible_files:
+            return {
+                "success": False,
+                "error": (
+                    f"No eligible source files found in '{norm_path.name}' matching the criteria. "
+                    f"Safety blacklist excluded system/dependency folders (node_modules, .git, .venv)."
+                )
+            }
+
+        job_id = f"local_cb_{uuid.uuid4().hex[:12]}"
+        archive_name = f"LocalFolder: {norm_path.name}"
+
+        try:
+            with db_service.get_session() as session:
+                job = CodebaseIngestionJob(
+                    job_id=job_id,
+                    archive_name=archive_name,
+                    status="queued",
+                    total_files=len(eligible_files),
+                    created_at=datetime.datetime.utcnow(),
+                )
+                session.add(job)
+                session.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to create local ingestion job record: {db_err}")
+            return {"success": False, "error": f"Database error while creating job: {db_err}"}
+
+        # Launch background daemon thread
+        thread = threading.Thread(
+            target=cls._run_local_scan,
+            args=(job_id, norm_path, user_instructions, filters),
+            daemon=True,
+            name=f"local-scan-{job_id}"
+        )
+        thread.start()
+
+        logger.info(f"Local codebase job '{job_id}' queued for '{norm_path}'. Eligible files: {len(eligible_files)}.")
+        return {
+            "success": True,
+            "job_id": job_id,
+            "archive_name": archive_name,
+            "status": "queued",
+            "folder_path": str(norm_path),
+            "estimated_files": len(eligible_files),
+            "message": (
+                f"Scanning local directory '{norm_path.name}' ({len(eligible_files)} files). "
+                f"Clean functions are directly ingested & vectorized into the Knowledge Base. "
+                f"Any risky/conflicting items will be quarantined with negative impact reports."
+            )
+        }
+
+    @classmethod
+    def _run_local_scan(
+        cls,
+        job_id: str,
+        folder_path: Path,
+        user_instructions: str,
+        filters: Dict[str, Any]
+    ) -> None:
+        """
+        Background worker thread executing direct local directory scanning.
+        """
+        start_time = datetime.datetime.utcnow()
+        pre_chroma_count = 0
+        try:
+            if chroma_service._collection:
+                pre_chroma_count = chroma_service._collection.count()
+        except Exception:
+            pass
+
+        cls._update_job(job_id, status="processing")
+        file_results: List[Dict[str, Any]] = []
+        all_staged_functions: List[Dict[str, Any]] = []
+        total_staged = 0
+        total_conflicts = 0
+        processed = 0
+        skipped = 0
+
+        try:
+            eligible_files = cls._walk_eligible_files(folder_path, filter_config=filters)
+            cls._update_job(job_id, total_files=len(eligible_files))
+            known_hashes = cls._load_known_hashes()
+
+            for file_path in eligible_files:
+                try:
+                    rel_path = str(file_path.relative_to(folder_path))
+                except ValueError:
+                    rel_path = file_path.name
+
+                result_entry: Dict[str, Any] = {
+                    "file": rel_path,
+                    "status": "pending",
+                    "functions_staged": 0,
+                    "conflicts": 0,
+                    "skip_reason": None,
+                }
+
+                try:
+                    content = cls._read_file_safe(file_path)
+                    if content is None:
+                        result_entry["status"] = "skipped"
+                        result_entry["skip_reason"] = "Cannot decode file (binary or unreadable encoding)"
+                        skipped += 1
+                        file_results.append(result_entry)
+                        processed += 1
+                        cls._update_job(job_id, processed_files=processed, skipped_files=skipped)
+                        continue
+
+                    # Deduplication
+                    file_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+                    if file_hash in known_hashes:
+                        result_entry["status"] = "skipped"
+                        result_entry["skip_reason"] = "Identical content already indexed (SHA-256 match)"
+                        skipped += 1
+                        file_results.append(result_entry)
+                        processed += 1
+                        cls._update_job(job_id, processed_files=processed, skipped_files=skipped)
+                        continue
+
+                    known_hashes.add(file_hash)
+
+                    # Ingest file (with intelligent risk evaluation & direct auto-vectorization!)
+                    ingest_result = CodeDocIngestionService.ingest_code_or_doc_file(
+                        file_path=str(file_path),
+                        original_filename=file_path.name,
+                        author_notes=f"Local Scan: {folder_path.name}/{rel_path} | Instructions: {user_instructions or 'None'}"
+                    )
+
+                    if ingest_result.get("success"):
+                        funcs = ingest_result.get("total_extracted", 0)
+                        conflicts = ingest_result.get("conflicts_count", 0)
+                        total_staged += funcs
+                        total_conflicts += conflicts
+                        result_entry["status"] = "processed"
+                        result_entry["functions_staged"] = funcs
+                        result_entry["conflicts"] = conflicts
+
+                        # Accumulate function records for audit logging
+                        extracted_items = ingest_result.get("staged_functions", [])
+                        for it in extracted_items:
+                            it["source_file"] = rel_path
+                        all_staged_functions.extend(extracted_items)
+                    else:
+                        result_entry["status"] = "skipped"
+                        result_entry["skip_reason"] = ingest_result.get("error", "No functions extracted")
+                        skipped += 1
+
+                except Exception as file_err:
+                    logger.warning(f"Error scanning file '{rel_path}': {file_err}")
+                    result_entry["status"] = "error"
+                    result_entry["skip_reason"] = str(file_err)
+
+                file_results.append(result_entry)
+                processed += 1
+                cls._update_job(
+                    job_id,
+                    processed_files=processed,
+                    skipped_files=skipped,
+                    total_functions_staged=total_staged,
+                    total_conflicts=total_conflicts,
+                )
+
+            # Audit logging: measure vector count and write dedicated logs
+            post_chroma_count = pre_chroma_count
+            try:
+                if chroma_service._collection:
+                    post_chroma_count = chroma_service._collection.count()
+            except Exception:
+                pass
+
+            chroma_stats = {
+                "collection_name": "devknow_functions",
+                "metric_space": "cosine (hnsw:space)",
+                "pre_count": pre_chroma_count,
+                "post_count": post_chroma_count,
+                "embedding_model": Config.EMBEDDING_MODEL
+            }
+            completed_time = datetime.datetime.utcnow()
+
+            # Generate dedicated audit logs for MySQL and VectorDB (Zero terminal pollution)
+            log_manifest = IngestionAuditLogger.generate_audit_logs(
+                job_id=job_id,
+                source_name=folder_path.name,
+                job_type="local_scan",
+                start_time=start_time,
+                completed_at=completed_time,
+                file_results=file_results,
+                staged_functions=all_staged_functions,
+                chroma_stats=chroma_stats,
+                job_status="completed"
+            )
+
+            summary_payload = {
+                "files": file_results,
+                "audit_logs": log_manifest
+            }
+
+            cls._update_job(
+                job_id,
+                status="completed",
+                processed_files=processed,
+                skipped_files=skipped,
+                total_functions_staged=total_staged,
+                total_conflicts=total_conflicts,
+                completed_at=completed_time,
+                result_summary=json.dumps(summary_payload),
+            )
+            logger.info(
+                f"Local scan job '{job_id}' completed for '{folder_path.name}'. "
+                f"Files: {processed} processed, {skipped} skipped. Functions: {total_staged}. "
+                f"Audit logs: {log_manifest.get('summary_log_filename')}."
+            )
+
+        except Exception as fatal_err:
+            logger.error(f"Local scan job '{job_id}' failed: {fatal_err}")
+            completed_time = datetime.datetime.utcnow()
+            log_manifest = IngestionAuditLogger.generate_audit_logs(
+                job_id=job_id,
+                source_name=folder_path.name,
+                job_type="local_scan",
+                start_time=start_time,
+                completed_at=completed_time,
+                file_results=file_results,
+                staged_functions=all_staged_functions,
+                job_status="failed",
+                error_message=str(fatal_err)
+            )
+            summary_payload = {
+                "files": file_results,
+                "audit_logs": log_manifest
+            }
+            cls._update_job(
+                job_id,
+                status="failed",
+                error_message=str(fatal_err),
+                completed_at=completed_time,
+                result_summary=json.dumps(summary_payload),
+            )
+
+    @classmethod
+    def _walk_eligible_files(cls, root: Path, filter_config: Optional[Dict[str, Any]] = None) -> List[Path]:
+        """
+        Recursively walks directory applying IMMUTABLE safety blacklist and optional user filters.
         """
         eligible = []
+        allowed_exts = filter_config.get("allowed_extensions", SUPPORTED_EXTENSIONS) if filter_config else SUPPORTED_EXTENSIONS
+        path_keywords = filter_config.get("path_keywords", []) if filter_config else []
+
         for dirpath, dirnames, filenames in os.walk(root):
-            # Prune skip directories in-place (modifying dirnames stops os.walk from descending)
+            # Prune blacklist directories in-place (IMMUTABLE SAFETY RULE)
             dirnames[:] = [
                 d for d in dirnames
                 if d not in SKIP_DIRS and not d.startswith(".")
             ]
 
             for fname in filenames:
-                # Skip files matching test/boilerplate filename patterns
                 lower_fname = fname.lower()
+                # Blacklist test/build patterns
                 if any(pat in lower_fname for pat in SKIP_FILENAME_PATTERNS):
                     continue
 
                 ext = Path(fname).suffix.lower()
-                if ext not in SUPPORTED_EXTENSIONS:
+                if ext not in allowed_exts:
                     continue
 
                 file_path = Path(dirpath) / fname
 
-                # Skip files that exceed the size limit (likely generated/minified)
+                # If user specified path keywords (e.g. 'service', 'controller')
+                if path_keywords:
+                    full_str = str(file_path).lower()
+                    if not any(kw in full_str for kw in path_keywords):
+                        continue
+
+                # Skip oversized files
                 try:
                     if file_path.stat().st_size > MAX_FILE_SIZE_BYTES:
-                        logger.debug(f"Skipping oversized file: {file_path.name} ({file_path.stat().st_size} bytes)")
                         continue
                 except OSError:
                     continue

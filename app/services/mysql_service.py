@@ -113,8 +113,33 @@ class DatabaseService:
 
         # Create all tables (functions, files, conversations, messages, logs) if not present
         Base.metadata.create_all(self._engine)
+        self._ensure_columns_exist()
         self._session_factory = scoped_session(sessionmaker(bind=self._engine, autoflush=False, autocommit=False))
         logger.info("Database tables initialized successfully.")
+
+    def _ensure_columns_exist(self) -> None:
+        """Adds missing columns (e.g. risk_level, risk_explanation) to existing tables if needed."""
+        try:
+            with self._engine.connect() as conn:
+                # Check functions table
+                is_sqlite = "sqlite" in str(self._engine.url)
+                if is_sqlite:
+                    cols = [row[1] for row in conn.execute(text("PRAGMA table_info(functions)")).fetchall()]
+                    if "risk_level" not in cols:
+                        conn.execute(text("ALTER TABLE functions ADD COLUMN risk_level VARCHAR(50) DEFAULT 'low'"))
+                    if "risk_explanation" not in cols:
+                        conn.execute(text("ALTER TABLE functions ADD COLUMN risk_explanation TEXT DEFAULT ''"))
+                    conn.commit()
+                else:
+                    # MySQL
+                    cols = [row[0] for row in conn.execute(text("SHOW COLUMNS FROM functions")).fetchall()]
+                    if "risk_level" not in cols:
+                        conn.execute(text("ALTER TABLE functions ADD COLUMN risk_level VARCHAR(50) DEFAULT 'low'"))
+                    if "risk_explanation" not in cols:
+                        conn.execute(text("ALTER TABLE functions ADD COLUMN risk_explanation TEXT"))
+                    conn.commit()
+        except Exception as e:
+            logger.debug(f"Schema column check notice: {e}")
 
     @contextmanager
     def get_session(self) -> Generator[Session, None, None]:

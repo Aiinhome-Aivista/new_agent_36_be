@@ -136,13 +136,12 @@ def _log_treesitter_result(
         latest_analysis_file = ts_dir / "treesitter_latest_analysis.json"
         latest_analysis_file.write_text(json.dumps(entry, indent=2), encoding="utf-8")
 
-        print(
+        logger.debug(
             f"  [Tree-sitter Inspection] "
             f"Parsed '{result.get('function_name', 'unnamed')}' | "
             f"Complexity: {result.get('complexity', 1)} | "
             f"Syntax: {'Valid' if result.get('is_valid_syntax') else 'Irregular'} | "
-            f"Params: {result.get('parameters', [])}",
-            flush=True
+            f"Params: {result.get('parameters', [])}"
         )
     except Exception:
         pass
@@ -735,17 +734,10 @@ class CodeParserService:
             latest_file = ts_dir / "treesitter_extracted_functions.json"
             latest_file.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            print(f"\n{sep}", flush=True)
-            print(f"  [Tree-sitter Engine] Full File Extraction Complete:", flush=True)
-            print(f"- Source File               : {source_filename or 'Direct Input'}", flush=True)
-            print(f"- Language                  : {norm_lang.upper()}", flush=True)
-            print(f"- Total Functions Discovered: {len(results)}", flush=True)
-            for sl in summary_lines:
-                print(sl, flush=True)
-            print(f"  Dedicated Tree-sitter Log File  -> {per_file_log.name}", flush=True)
-            print(f"  Dedicated Tree-sitter JSON File -> {per_file_json.name}", flush=True)
-            print(f"  Latest Pointer File             -> treesitter_extracted_functions.json", flush=True)
-            print(f"{sep}\n", flush=True)
+            logger.debug(
+                f"[Tree-sitter Engine] Full File Extraction Complete: {source_filename or 'Direct Input'} | "
+                f"Language: {norm_lang.upper()} | Functions: {len(results)} | Log: {per_file_log.name}"
+            )
 
         except Exception as log_err:
             logger.debug(f"Tree-sitter logger write error: {log_err}")

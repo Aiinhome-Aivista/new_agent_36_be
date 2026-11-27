@@ -24,6 +24,7 @@ from pathlib import Path
 from app.services.mysql_service import db_service
 from app.services.chroma_service import chroma_service
 from app.services.code_parser_service import code_parser
+from app.services.code_risk_analyzer import code_risk_analyzer
 from app.services.gemini_service import gemini_service
 from app.models.database_models import FunctionRecord, KnowledgeBaseFile
 
@@ -241,7 +242,24 @@ class CodeDocIngestionService:
                         next_version = "1.0.0"
                         rule_desc = f"New function extracted from source file '{filename}'"
 
-                    # 2. Semantic Context Generation
+                    # 2. Risk & Anomaly Assessment (Auto-Ingestion vs Quarantine)
+                    risk_eval = code_risk_analyzer.analyze_function(
+                        code_body=fn_body,
+                        ast_meta=item,
+                        existing_function=existing,
+                        language=language
+                    )
+
+                    if risk_eval["is_quarantined"]:
+                        ver_status = "pending_review"
+                        r_level = risk_eval["risk_level"]
+                        r_explanation = risk_eval["risk_explanation"]
+                    else:
+                        ver_status = "verified"
+                        r_level = "low"
+                        r_explanation = ""
+
+                    # 3. Semantic Context Generation
                     description = cls._generate_semantic_context(
                         fn_name=fn_name,
                         code_snippet=item.get("full_code", fn_body),
@@ -251,7 +269,7 @@ class CodeDocIngestionService:
                         author_notes=author_notes
                     )
 
-                    # 3. Store into Staging Queue (verification_status='pending_review')
+                    # 4. Store Record (Clean code = verified, Risky code = pending_review)
                     staged_record = FunctionRecord(
                         rule_version_name=f"SourceFile_{Path(filename).stem}",
                         rule_version_description=rule_desc,
@@ -264,8 +282,10 @@ class CodeDocIngestionService:
                         description=description,
                         additional_metadata=f"Tree-sitter Complexity: {complexity} | Params: {', '.join(params)} | Lines: {item.get('start_line', 1)}-{item.get('end_line', 1)}",
                         knowledge_source="code_file",
-                        verification_status="pending_review",
+                        verification_status=ver_status,
                         conflict_status=conflict_status,
+                        risk_level=r_level,
+                        risk_explanation=r_explanation,
                         parent_function_id=parent_id,
                         source_file_id=file_id if file_id > 0 else None,
                         created_at=datetime.datetime.utcnow(),
@@ -274,9 +294,29 @@ class CodeDocIngestionService:
                     session.add(staged_record)
                     session.flush()
 
+                    # 5. Direct Vectorization: Clean code is automatically indexed into ChromaDB!
+                    if ver_status == "verified":
+                        try:
+                            chroma_service.upsert_function(
+                                mysql_id=staged_record.id,
+                                function_name=fn_name,
+                                rule_version_name=staged_record.rule_version_name or "Verified_Code",
+                                rule_version_description=description or "",
+                                function_header=fn_header or "",
+                                programming_language=language,
+                                framework=Path(filename).suffix.lstrip("."),
+                                version=next_version,
+                                description=description or "",
+                                knowledge_source="code_file"
+                            )
+                        except Exception as e:
+                            logger.debug(f"Direct vectorization notice for {fn_name}: {e}")
+
                     staged_items.append({
                         "id": staged_record.id,
                         "function_name": fn_name,
+                        "function_header": fn_header,
+                        "rule_version_name": staged_record.rule_version_name or f"SourceFile_{Path(filename).stem}",
                         "language": language,
                         "version": next_version,
                         "conflict_status": conflict_status,
@@ -284,10 +324,15 @@ class CodeDocIngestionService:
                         "complexity": complexity,
                         "parameters": params,
                         "description": description,
+                        "verification_status": ver_status,
+                        "risk_level": r_level,
+                        "risk_explanation": r_explanation,
                         "start_line": item.get("start_line", 1),
                         "end_line": item.get("end_line", 1),
                         "return_type": ret_type,
-                        "parser_engine": item.get("parser_engine", "tree-sitter")
+                        "parser_engine": item.get("parser_engine", "tree-sitter"),
+                        "vector_id": f"fn_{staged_record.id}" if ver_status == "verified" else None,
+                        "vectorized": (ver_status == "verified")
                     })
 
                 # Update file summary
@@ -431,10 +476,18 @@ class CodeDocIngestionService:
                 staged_items.append({
                     "id": staged_record.id,
                     "function_name": fn_name,
+                    "function_header": first_line,
+                    "rule_version_name": staged_record.rule_version_name or f"Doc_{Path(filename).stem}",
                     "language": lang,
                     "version": next_version,
                     "conflict_status": conflict_status,
-                    "description": description
+                    "parent_function_id": parent_id,
+                    "description": description,
+                    "verification_status": "pending_review",
+                    "risk_level": "safe",
+                    "risk_explanation": None,
+                    "vector_id": None,
+                    "vectorized": False
                 })
 
             kb_f = session.query(KnowledgeBaseFile).filter_by(id=file_id).first()
@@ -488,13 +541,10 @@ class CodeDocIngestionService:
                 )
             per_doc_log.write_text(log_body, encoding="utf-8")
 
-            print(f"\n{sep}", flush=True)
-            print(f"  [Tree-sitter Engine] Documentation Ingestion Complete:", flush=True)
-            print(f"- Source File               : {filename}", flush=True)
-            print(f"- Total Snippets/Rules      : {len(staged_items)}", flush=True)
-            print(f"  Dedicated Tree-sitter Log  -> {per_doc_log.name}", flush=True)
-            print(f"  Dedicated Tree-sitter JSON -> {per_doc_json.name}", flush=True)
-            print(f"{sep}\n", flush=True)
+            logger.debug(
+                f"[Tree-sitter Engine] Doc Ingestion Complete: {filename} | "
+                f"Snippets: {len(staged_items)} | Log: {per_doc_log.name}"
+            )
         except Exception as e:
             logger.debug(f"Doc Tree-sitter logging notice: {e}")
 
