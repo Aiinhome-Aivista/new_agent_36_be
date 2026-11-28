@@ -21,11 +21,13 @@ Coordinates the end-to-end Retrieval-Augmented Generation (RAG) workflow:
 import time
 import json
 import logging
+from pathlib import Path
 from typing import Dict, Any, Generator, List, Optional
 
 from app.config import Config
 from app.services.mysql_service import db_service
 from app.services.chroma_service import chroma_service
+from app.services.hybrid_search_service import hybrid_search_service
 from app.services.gemini_service import gemini_service
 from app.services.code_parser_service import code_parser
 from app.services.query_router import QueryRouter
@@ -82,6 +84,50 @@ class RetrievalService:
             return "\n".join(formatted)
 
     @classmethod
+    def reformulate_conversational_query(cls, query: str, session_id: str) -> str:
+        """
+        Reformulates conversational follow-up questions (e.g. 'what about timeouts for that?')
+        into standalone search queries using recent dialogue keywords from conversation history.
+        """
+        if not Config.ENABLE_QUERY_REFORMULATION or not session_id:
+            return query
+
+        history = cls.get_conversation_history(session_id, limit=3)
+        if not history or history == "None" or len(history.strip()) < 15:
+            return query
+
+        query_lower = query.lower().strip()
+        words = query_lower.split()
+        follow_up_tokens = {"that", "this", "it", "these", "those", "same", "above", "also", "instead", "why", "how"}
+        has_signal = (
+            len(words) <= 5 or
+            any(w in follow_up_tokens for w in words) or
+            any(ph in query_lower for ph in ["what about", "how about", "and for", "and in", "why did", "difference between"])
+        )
+
+        if not has_signal:
+            return query
+
+        prompt = (
+            f"You are a developer search query contextualizer. Given the recent conversation history and a follow-up user query, "
+            f"rewrite the follow-up query as a standalone search query that includes the relevant technical topic/subject.\n\n"
+            f"Conversation History:\n{history[-600:]}\n\n"
+            f"Follow-up Query: {query}\n\n"
+            f"Return ONLY the rewritten search query. No quotes, no markdown, no explanation."
+        )
+        try:
+            rewritten = gemini_service.generate_text(prompt)
+            if rewritten:
+                clean_rewrite = rewritten.strip().strip("\"'")
+                if len(clean_rewrite) >= len(query) and len(clean_rewrite) < 180:
+                    logger.info(f"Conversational Query Reformulation: '{query}' -> '{clean_rewrite}'")
+                    return clean_rewrite
+        except Exception as e:
+            logger.debug(f"Query reformulation notice: {e}")
+
+        return query
+
+    @classmethod
     def execute_rag(
         cls,
         query: str,
@@ -132,6 +178,11 @@ class RetrievalService:
         is_security_blocked = routing.get("security_flag", False) or intent == "prompt_injection"
         is_out_of_scope = intent == "out_of_scope"
 
+        # Step 1b: Conversational Query Reformulation for follow-up turns
+        effective_query = cls.reformulate_conversational_query(query, session_id)
+        is_query_reformulated = (effective_query != query)
+        child_dependencies: List[Dict[str, Any]] = []
+
         # Step 2: Vector Search in ChromaDB (Bypassed if prompt_injection or out_of_scope)
         retrieved_functions: List[Dict[str, Any]] = []
         context_functions_str = ""
@@ -141,11 +192,12 @@ class RetrievalService:
             max_score = 0.0
             is_kb_hit = False
         else:
-            search_query = query
+            search_query = effective_query
             if attached_code:
                 search_query += f"\nCode Context: {attached_code[:500]}"
 
-            vector_matches = chroma_service.search_similar(
+            # Step 2: Enterprise Hybrid Retrieval (Dense Vector + Exact Symbol RRF)
+            vector_matches = hybrid_search_service.search(
                 query=search_query,
                 top_k=Config.RETRIEVAL_TOP_K,
                 language=filter_lang
@@ -173,6 +225,8 @@ class RetrievalService:
                             rec = record_map[r_id]
                             fn_dict = rec.to_dict()
                             fn_dict["similarity"] = vm["similarity"]
+                            fn_dict["match_type"] = vm.get("match_type", "vector_semantic")
+                            fn_dict["rrf_score"] = vm.get("rrf_score", 0.0)
                             retrieved_functions.append(fn_dict)
 
                 missing_ids = [m_id for m_id in mysql_ids if m_id not in record_map]
@@ -203,19 +257,162 @@ class RetrievalService:
                         f"(Max similarity: {round(max_score, 4)})."
                     )
 
+                # Step 3b: Call-Graph Dependency Expansion (Token-Budgeted, Multi-Hop, Proximity-Boosted)
+                cg_used_tokens = 0
+                cg_max_depth_reached = 1
+                if retrieved_functions and Config.ENABLE_CALL_GRAPH_EXPANSION:
+                    token_budget = Config.CALL_GRAPH_TOKEN_BUDGET
+                    max_depth = Config.CALL_GRAPH_MAX_DEPTH
+                    stub_threshold = Config.CALL_GRAPH_STUB_THRESHOLD_LINES
+                    max_children = Config.CALL_GRAPH_MAX_CHILDREN
+                    proximity_boost = Config.CALL_GRAPH_PROXIMITY_BOOST
+
+                    known_names = {f["function_name"] for f in retrieved_functions}
+                    call_queue: List[tuple] = []
+
+                    # Seed queue with Level 1 calls from retrieved primary functions
+                    for f in retrieved_functions:
+                        body = f.get("function_body", "")
+                        lang = f.get("programming_language", "python")
+                        f_path = f.get("file_path") or f.get("rule_version_name")
+                        calls = code_parser.extract_invoked_calls(body, lang)
+                        for c in calls:
+                            if c not in known_names and c not in [item[0] for item in call_queue]:
+                                call_queue.append((c, f_path, 1))
+
+                    while call_queue and len(child_dependencies) < max_children and cg_used_tokens < token_budget:
+                        target_name, caller_file, current_depth = call_queue.pop(0)
+                        if target_name in known_names:
+                            continue
+
+                        cg_max_depth_reached = max(cg_max_depth_reached, current_depth)
+
+                        with db_service.get_session() as session:
+                            candidates = session.query(FunctionRecord).filter(
+                                FunctionRecord.function_name == target_name,
+                                (FunctionRecord.verification_status == "verified") | (FunctionRecord.verification_status.is_(None))
+                            ).all()
+
+                            if not candidates:
+                                known_names.add(target_name)
+                                continue
+
+                            def get_record_file(r: FunctionRecord) -> str:
+                                sf = getattr(r, "source_file", None)
+                                sf_path = getattr(sf, "file_path", None) if sf else None
+                                return sf_path or getattr(r, "rule_version_name", "") or ""
+
+                            # Rank candidates by file/directory proximity
+                            def score_proximity(rec: FunctionRecord) -> int:
+                                rec_file = get_record_file(rec)
+                                if not proximity_boost or not caller_file or not rec_file:
+                                    return 10
+                                caller_p = Path(caller_file).name.lower()
+                                rec_p = Path(rec_file).name.lower()
+                                if rec_p == caller_p:
+                                    return 100  # Exact same file
+                                caller_parent = Path(caller_file).parent.name.lower()
+                                rec_parent = Path(rec_file).parent.name.lower()
+                                if caller_parent and rec_parent and caller_parent == rec_parent:
+                                    return 50   # Sibling file in same directory/package
+                                return 10       # Global match
+
+                            candidates.sort(key=lambda r: (score_proximity(r), len((r.function_body or "").split("\n"))), reverse=True)
+                            best_rec = candidates[0]
+                            best_file = get_record_file(best_rec)
+                            known_names.add(target_name)
+
+                            body_lines = (best_rec.function_body or "").strip().split("\n")
+                            line_count = len(body_lines)
+                            raw_tokens = max(1, len(best_rec.function_body or "") // 4)
+
+                            is_stub = False
+                            selected_code = best_rec.function_body or ""
+
+                            # Stub condition:
+                            # 1. Depth > 1 (grandchildren are compact stubs to conserve budget)
+                            # 2. Or lines exceed threshold lines (e.g. > 50 lines)
+                            # 3. Or full body exceeds remaining token budget
+                            if current_depth > 1 or line_count > stub_threshold or (cg_used_tokens + raw_tokens > token_budget):
+                                stub_code = code_parser.generate_skeleton_stub(
+                                    code=best_rec.function_body or "",
+                                    language=best_rec.programming_language,
+                                    max_lines=stub_threshold,
+                                    source_file=best_file
+                                )
+                                stub_tokens = max(1, len(stub_code) // 4)
+                                if cg_used_tokens + stub_tokens <= token_budget:
+                                    selected_code = stub_code
+                                    is_stub = True
+                                    cg_used_tokens += stub_tokens
+                                else:
+                                    break
+                            else:
+                                cg_used_tokens += raw_tokens
+
+                            c_dict = best_rec.to_dict()
+                            c_dict["file_path"] = best_file
+                            c_dict["function_body"] = selected_code
+                            c_dict["is_stub"] = is_stub
+                            c_dict["depth"] = current_depth
+                            c_dict["match_type"] = f"ast_call_hop_{current_depth}"
+                            child_dependencies.append(c_dict)
+
+                            # If current depth < max_depth and full body was included, enqueue grandchild calls
+                            if current_depth < max_depth and not is_stub and len(child_dependencies) < max_children:
+                                child_calls = code_parser.extract_invoked_calls(best_rec.function_body or "", best_rec.programming_language)
+                                for cc in child_calls:
+                                    if cc not in known_names and cc not in [item[0] for item in call_queue]:
+                                        call_queue.append((cc, best_file, current_depth + 1))
+
+                    if child_dependencies:
+                        logger.info(
+                            f"[CALL-GRAPH EXPANSION] Successfully pulled {len(child_dependencies)} dependency(ies) "
+                            f"(Depth: {cg_max_depth_reached}, Budget: {cg_used_tokens}/{token_budget} tokens): "
+                            f"{[c['function_name'] + (' [stub]' if c.get('is_stub') else '') for c in child_dependencies]}"
+                        )
+
                 # Build readable context for prompt ONLY if verified functions exist in database
                 if retrieved_functions:
                     context_blocks = []
                     for i, f in enumerate(retrieved_functions, 1):
-                        block = [
-                            f"### Function #{i}: {f['function_name']} (Language: {f['programming_language']}, Version: {f['version']})",
-                            f"- Module/Rule: {f.get('rule_version_name', 'N/A')}",
-                            f"- Class/Namespace: {f.get('class_name', '')} {f.get('namespace', '')}".strip() or "- Class/Namespace: None",
-                            f"- Description: {f.get('description', 'N/A')}",
-                            f"- Signature: {f['function_header']}",
-                            f"- Exact Original Implementation:\n```{f['programming_language'].lower()}\n{f['function_body']}\n```"
-                        ]
+                        is_summary = f.get("knowledge_source") == "file_summary" or f.get("function_name", "").startswith(Config.FILE_SUMMARY_PREFIX)
+                        if is_summary:
+                            block = [
+                                f"### Architectural Blueprint #{i}: {f['function_name']} (Language: {f['programming_language']}, Version: {f['version']})",
+                                f"- Scope: Hierarchical File Summary & Class/Function Catalog",
+                                f"- Module/File: {f.get('rule_version_name', 'N/A')}",
+                                f"- Description: {f.get('description', 'N/A')}",
+                                f"- File Structure & Architecture Overview:\n```{f['programming_language'].lower()}\n{f['function_body']}\n```"
+                            ]
+                        else:
+                            parent_cls = f.get("class_name") or "Top-level / Global"
+                            block = [
+                                f"### Function #{i}: {f['function_name']} (Language: {f['programming_language']}, Version: {f['version']})",
+                                f"- Module/Rule: {f.get('rule_version_name', 'N/A')}",
+                                f"- Parent Class: {parent_cls}",
+                                f"- Namespace: {f.get('namespace') or 'N/A'}",
+                                f"- Description: {f.get('description', 'N/A')}",
+                                f"- Signature: {f['function_header']}",
+                                f"- Exact Original Implementation:\n```{f['programming_language'].lower()}\n{f['function_body']}\n```"
+                            ]
                         context_blocks.append("\n".join(block))
+
+                    # Append direct child call dependencies discovered via Tree-sitter
+                    if child_dependencies:
+                        dep_blocks = ["\n## Direct Child Call Dependencies (Automatically resolved via Tree-sitter AST):"]
+                        for j, cd in enumerate(child_dependencies, 1):
+                            stub_note = " [Skeleton Stub - Interface Contract]" if cd.get("is_stub") else ""
+                            hop_note = f"Hop {cd.get('depth', 1)}"
+                            loc_note = cd.get("file_path") or cd.get("rule_version_name") or "Local Module"
+                            dep_blocks.append(
+                                f"### Helper Dependency #{j}: {cd['function_name']}{stub_note} (Level: {hop_note}, Origin: {loc_note})\n"
+                                f"- Signature: {cd['function_header']}\n"
+                                f"- Purpose: {cd.get('description', 'Internal helper function called by parent logic')}\n"
+                                f"- Implementation / Contract:\n```{cd['programming_language'].lower()}\n{cd['function_body']}\n```"
+                            )
+                        context_blocks.append("\n\n".join(dep_blocks))
+
                     context_functions_str = "\n\n".join(context_blocks)
 
             # CRITICAL: A true KB Hit ONLY exists if verified records were successfully fetched from MySQL!
@@ -306,7 +503,7 @@ class RetrievalService:
             attribution_label = "Domain Guardrail"
         elif is_kb_hit:
             raw_kb = int(round(max_score * 100))
-            kb_ratio = max(65, min(95, raw_kb))
+            kb_ratio = max(Config.RAG_KB_RATIO_MIN, min(Config.RAG_KB_RATIO_MAX, raw_kb))
             llm_ratio = 100 - kb_ratio
             attribution_label = "Runbook Grounded"
         else:
@@ -319,7 +516,10 @@ class RetrievalService:
             "llm_percentage": llm_ratio,
             "attribution_label": attribution_label,
             "similarity_score": round(max_score, 4),
-            "retrieved_count": len(retrieved_functions)
+            "retrieved_count": len(retrieved_functions),
+            "child_dependencies_count": len(child_dependencies),
+            "call_graph_tokens_used": cg_used_tokens,
+            "call_graph_depth": cg_max_depth_reached
         }
 
         # Step 7: Assemble Thinking Process for UI Reasoning Disclosure
@@ -366,32 +566,57 @@ class RetrievalService:
                 {
                     "title": "Intent & Language Routing",
                     "detail": f"Classified intent as '{intent.replace('_', ' ')}'. Language filter: '{filter_lang or 'all'}'."
-                },
+                }
+            ]
+            if is_query_reformulated:
+                thinking_steps.append({
+                    "title": "Conversational Query Reformulation",
+                    "detail": f"Contextualized follow-up query using conversation history: '{query}' -> '{effective_query}'."
+                })
+            thinking_steps.extend([
                 {
-                    "title": "Runbook Semantic Search",
-                    "detail": f"Searched organizational runbooks — found {len(vector_matches)} candidate(s) (highest match: {round(max_score * 100, 1)}%)." if vector_matches else "Searched organizational runbooks. No semantic matches found."
+                    "title": "Hybrid RAG Retrieval (Dense Vector + Exact Symbol RRF)",
+                    "detail": (
+                        f"Executed 2-stage hybrid search (dense ChromaDB vector + exact symbol lookup). "
+                        f"Found {len(vector_matches)} candidate(s) (top similarity: {round(max_score * 100, 1)}%, "
+                        f"top match type: {vector_matches[0].get('match_type', 'semantic')})."
+                        if vector_matches else "Executed hybrid search. No semantic or exact symbol matches found."
+                    )
                 },
                 {
                     "title": "Knowledge Grounding Check",
                     "detail": (
-                        f"Retrieved {len(retrieved_functions)} verified function(s) verbatim from database."
+                        f"Retrieved {len(retrieved_functions)} verified function(s)/blueprint(s) verbatim from database."
                         if is_kb_hit
                         else (
-                            f"Vector index returned {len(vector_matches)} candidate(s), but corresponding code records were missing in MySQL database (database drift). Grounding denied; safely routing to General AI."
+                            f"Hybrid retrieval returned {len(vector_matches)} candidate(s), but corresponding code records were missing in MySQL database (database drift). Grounding denied; safely routing to General AI."
                             if (has_potential_match and not retrieved_functions)
                             else f"No company function exceeded similarity threshold ({Config.SIMILARITY_THRESHOLD}). Activating general developer intelligence."
                         )
                     )
-                },
+                }
+            ])
+            if child_dependencies:
+                stubs_count = sum(1 for c in child_dependencies if c.get("is_stub"))
+                stub_detail = f" ({stubs_count} skeleton stub(s))" if stubs_count > 0 else ""
+                thinking_steps.append({
+                    "title": "Call-Graph Dependency Resolution (Tree-sitter AST)",
+                    "detail": (
+                        f"Traversed AST call graph (Depth: {cg_max_depth_reached}, Budget: {cg_used_tokens}/{Config.CALL_GRAPH_TOKEN_BUDGET} tokens). "
+                        f"Pulled {len(child_dependencies)} verified helper dependency(ies){stub_detail}: "
+                        f"({', '.join([c['function_name'] + (' [stub]' if c.get('is_stub') else '') for c in child_dependencies])}) into prompt context."
+                    )
+                })
+            thinking_steps.extend([
                 {
                     "title": "Response Synthesis",
                     "detail": "Grounding response in verified organizational code and runbook logic." if is_kb_hit else ("Synthesizing polite conversational greeting." if intent == "greeting" else "Synthesizing solution using idiomatic programming practices.")
                 },
                 {
                     "title": "Grounding & RAG Attribution",
-                    "detail": f"Verified RAG ratio: {kb_ratio}% Knowledge Base (Runbook match: {round(max_score * 100, 1)}%) + {llm_ratio}% LLM synthesis & reasoning." if is_kb_hit else "Verified RAG ratio: 0% Knowledge Base (no company runbook met threshold) + 100% General LLM programming knowledge."
+                    "detail": f"Verified RAG ratio: {kb_ratio}% Knowledge Base (Hybrid match: {round(max_score * 100, 1)}%) + {llm_ratio}% LLM synthesis & reasoning." if is_kb_hit else "Verified RAG ratio: 0% Knowledge Base (no company runbook met threshold) + 100% General LLM programming knowledge."
                 }
-            ]
+            ])
 
         # Step 7b: Run Tree-sitter Code Inspection on retrieved or attached code
         code_to_inspect = attached_code
@@ -449,6 +674,7 @@ class RetrievalService:
             "intent": intent,
             "max_score": max_score,
             "retrieved_functions": retrieved_functions,
+            "child_dependencies": child_dependencies,
             "prompt": prompt,
             "thinking_steps": thinking_steps,
             "grounding_stats": grounding_stats,

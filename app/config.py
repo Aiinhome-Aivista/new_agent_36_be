@@ -102,6 +102,52 @@ class Config:
     CONVERSATION_MEMORY_TURNS = int(os.getenv("CONVERSATION_MEMORY_TURNS", 10))
     AUTO_SAVE_LLM_ANSWERS = os.getenv("AUTO_SAVE_LLM_ANSWERS", "false").lower() == "true"
 
+    # ── Call-Graph Dependency Expansion & Query Reformulation Settings ──────────
+    ENABLE_CALL_GRAPH_EXPANSION = os.getenv("ENABLE_CALL_GRAPH_EXPANSION", "true").lower() == "true"
+    CALL_GRAPH_MAX_DEPTH = int(os.getenv("CALL_GRAPH_MAX_DEPTH", 2))
+    CALL_GRAPH_TOKEN_BUDGET = int(os.getenv("CALL_GRAPH_TOKEN_BUDGET", 1200))
+    CALL_GRAPH_STUB_THRESHOLD_LINES = int(os.getenv("CALL_GRAPH_STUB_THRESHOLD_LINES", 50))
+    CALL_GRAPH_PROXIMITY_BOOST = os.getenv("CALL_GRAPH_PROXIMITY_BOOST", "true").lower() == "true"
+    CALL_GRAPH_MAX_CHILDREN = int(os.getenv("CALL_GRAPH_MAX_CHILDREN", 5))
+    ENABLE_QUERY_REFORMULATION = os.getenv("ENABLE_QUERY_REFORMULATION", "true").lower() == "true"
+
+    # ── Hybrid Retrieval & Reciprocal Rank Fusion (RRF) Settings ────────────────
+    RRF_K = int(os.getenv("RRF_K", 60))
+    RRF_VECTOR_WEIGHT = float(os.getenv("RRF_VECTOR_WEIGHT", 1.0))
+    RRF_KEYWORD_WEIGHT = float(os.getenv("RRF_KEYWORD_WEIGHT", 1.25))
+    RRF_CANDIDATE_LIMIT = int(os.getenv("RRF_CANDIDATE_LIMIT", 15))
+    RRF_CANDIDATE_MULTIPLIER = int(os.getenv("RRF_CANDIDATE_MULTIPLIER", 3))
+
+    # Keyword Channel Scoring Weights
+    RRF_KEYWORD_EXACT_FN_SCORE = float(os.getenv("RRF_KEYWORD_EXACT_FN_SCORE", 10.0))
+    RRF_KEYWORD_PARTIAL_FN_SCORE = float(os.getenv("RRF_KEYWORD_PARTIAL_FN_SCORE", 5.0))
+    RRF_KEYWORD_CLASS_SCORE = float(os.getenv("RRF_KEYWORD_CLASS_SCORE", 8.0))
+    RRF_KEYWORD_HEADER_SCORE = float(os.getenv("RRF_KEYWORD_HEADER_SCORE", 3.0))
+
+    # RAG Grounding Attribution Bounds (Min/Max % split for KB hits)
+    RAG_KB_RATIO_MIN = int(os.getenv("RAG_KB_RATIO_MIN", 65))
+    RAG_KB_RATIO_MAX = int(os.getenv("RAG_KB_RATIO_MAX", 95))
+
+    # Code Ingestion & Blueprint Settings
+    FILE_SUMMARY_PREFIX = os.getenv("FILE_SUMMARY_PREFIX", "FileSummary_")
+    DEFAULT_INITIAL_VERSION = os.getenv("DEFAULT_INITIAL_VERSION", "1.0.0")
+    CODEBASE_MAX_FILE_SIZE_KB = int(os.getenv("CODEBASE_MAX_FILE_SIZE_KB", 500))
+    SEMANTIC_BATCH_SIZE = int(os.getenv("SEMANTIC_BATCH_SIZE", 8))
+
+    # Ingestion Exclusions (Configurable via comma-separated string in .env)
+    CODEBASE_SKIP_DIRS = [
+        d.strip() for d in os.getenv(
+            "CODEBASE_SKIP_DIRS",
+            "__pycache__,node_modules,.git,.hg,.svn,bin,obj,dist,build,.venv,venv,env,.tox,.mypy_cache,.pytest_cache,coverage,.idea,.vscode,migrations,__MACOSX"
+        ).split(",") if d.strip()
+    ]
+    CODEBASE_SKIP_FILENAME_PATTERNS = [
+        p.strip() for p in os.getenv(
+            "CODEBASE_SKIP_FILENAME_PATTERNS",
+            "test_,_test,.test.,.spec.,.min.,.bundle.,setup.cfg,pyproject.toml,package-lock.json,yarn.lock,requirements.txt,Pipfile,Pipfile.lock,.env"
+        ).split(",") if p.strip()
+    ]
+
     # Configurable Excel Column Mapping (matches company runbook spreadsheet columns)
     EXCEL_COLUMNS = {
         "rule_version_name": os.getenv("COL_RULE_NAME", "RuleVersionName"),

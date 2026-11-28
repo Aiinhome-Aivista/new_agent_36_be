@@ -45,20 +45,11 @@ from app.config import Config
 logger = logging.getLogger("DevKnow.CodebaseIngestion")
 
 
-# ── Directories and extensions to skip entirely ────────────────────────────
-SKIP_DIRS = {
-    "__pycache__", "node_modules", ".git", ".hg", ".svn",
-    "bin", "obj", "dist", "build", ".venv", "venv", "env",
-    ".tox", ".mypy_cache", ".pytest_cache", "coverage",
-    ".idea", ".vscode", "migrations", "__MACOSX"
-}
+# ── Directories and extensions to skip entirely (dynamically loaded from Config/.env)
+SKIP_DIRS = set(Config.CODEBASE_SKIP_DIRS)
 
 # File name patterns to skip (test files, config boilerplate)
-SKIP_FILENAME_PATTERNS = {
-    "test_", "_test", ".test.", ".spec.", ".min.", ".bundle.",
-    "setup.cfg", "pyproject.toml", "package-lock.json", "yarn.lock",
-    "requirements.txt", "Pipfile", "Pipfile.lock", ".env"
-}
+SKIP_FILENAME_PATTERNS = set(Config.CODEBASE_SKIP_FILENAME_PATTERNS)
 
 # Supported code extensions (mirrors CodeDocIngestionService)
 SUPPORTED_EXTENSIONS = {
@@ -67,7 +58,7 @@ SUPPORTED_EXTENSIONS = {
 }
 
 # Max file size in bytes to process (skip binary or huge generated files)
-MAX_FILE_SIZE_BYTES = 500 * 1024  # 500 KB per file
+MAX_FILE_SIZE_BYTES = Config.CODEBASE_MAX_FILE_SIZE_KB * 1024
 
 
 class CodebaseIngestionService:

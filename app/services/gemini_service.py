@@ -450,6 +450,12 @@ class LLMService:
         chunks = list(self.stream_generate(prompt))
         return "".join(chunks)
 
+    def generate_text(self, prompt: str) -> str:
+        """
+        Alias for generate_single for synchronous non-streaming completions.
+        """
+        return self.generate_single(prompt)
+
 
 # Export singleton and alias for backwards compatibility
 llm_service = LLMService.get_instance()

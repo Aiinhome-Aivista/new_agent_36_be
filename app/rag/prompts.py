@@ -83,6 +83,32 @@ User Query / Greeting: {query}
 4. Keep the response natural, inviting, and clean. DO NOT output disclaimers or boilerplate reminders.
 """
 
+PRODUCTION_BEST_PRACTICES_RUBRIC = """### ENTERPRISE PRODUCTION BEST PRACTICE RUBRIC (THE 5 PILLARS):
+When the user asks for "best practices" or when explaining, writing, or refactoring architecture/infrastructure code (such as database connections, REST/HTTP APIs, authentication, background workers, or async tasks), strictly evaluate and adhere to these 5 production pillars:
+
+1. PILLAR 1: RESOURCE & LIFECYCLE MANAGEMENT
+   - Databases: Enforce connection pooling (e.g. QueuePool, pool_size, max_overflow, pool_recycle), idle connection timeouts, and lifecycle cleanup hooks. Never open unpooled raw sockets in hot paths.
+   - Sockets / Streams / Files: Always use context managers (`with` / `using`) or explicit teardown handlers to prevent file descriptor and socket leaks.
+
+2. PILLAR 2: RESILIENCE, HEALTH CHECKS & FAILOVER
+   - Databases: Enforce drop-socket detection and validation queries on checkout (e.g. `pool_pre_ping=True` in SQLAlchemy or equivalent ping before execution) to protect against dropped TCP connections.
+   - External APIs / Network Calls: Enforce explicit connection and read timeouts (never hang indefinitely), transient retry logic with exponential backoff and jitter, and graceful fallback.
+
+3. PILLAR 3: ZERO-TRUST SECURITY & CREDENTIAL ISOLATION
+   - Zero Hardcoded Secrets: Passwords, tokens, database URIs, and API keys must strictly be loaded from environment variables (`Config`, `os.getenv`, `process.env`) or Secret Vaults.
+   - Injection Prevention: Always use parameterized queries or ORM binds; NEVER concatenate user inputs into SQL strings.
+   - Transport Security: Mandate TLS/SSL (`sslmode=require` or HTTPS).
+
+4. PILLAR 4: DEFENSIVE CLEAN CODE & LOW COMPLEXITY
+   - Strong Typing: Provide complete, explicit type annotations (Python `typing`, TypeScript interfaces, C# types).
+   - Guard Clauses: Use early return guard checks to validate input boundaries and prevent `None`/`null` dereferences.
+   - Separation of Concerns: Maintain low cyclomatic complexity by decomposing complex routines into focused helper functions.
+   - Robust Exception Handling: Catch specific, typed exceptions; handle transient network drops gracefully; NEVER write empty `except: pass` or swallow errors silently.
+
+5. PILLAR 5: STRUCTURED OBSERVABILITY
+   - Use structured logger instances (`logger.info`, `logger.error`, `logger.warning`) with contextual metadata; NEVER use raw `print()` or `console.log()` in production code.
+"""
+
 KB_HIT_PROMPT_TEMPLATE = """### CONTEXT: RETRIEVED ORGANIZATIONAL FUNCTIONS FROM KNOWLEDGE BASE
 The following function(s) were retrieved from the organizational database:
 
@@ -103,16 +129,24 @@ The following function(s) were retrieved from the organizational database:
 Respond in a clean, direct, and user-friendly format:
 1. **NO ROBOTIC GREETINGS**: Do not start with generic intros like "Hello! I am DevKnow, your expert AI assistant...". Get straight to answering the user's question directly.
 2. **Executive Summary**: Start with a concise 1-2 sentence overview of what was found in the organizational runbook (e.g. "I found the following verified functions in the runbook for validating parts and breakers across C#, TypeScript, and JavaScript:").
-3. **Structured Breakdown by Purpose**: For each function, provide:
-   - **`FunctionName`** (`Language` • `Rule/Module Name`)
-   - **What it does**: Clear, conversational explanation of its purpose, inputs, and core logic.
-   - **Key Logic**: Highlight the exact condition or check it performs.
-4. **Code Presentation Rules**:
+3. **Structured Breakdown & Child Dependencies**:
+   - For each primary function, provide its name, language, purpose, and key logic.
+   - **Integrated Parent-Child Logic**: If the context includes 'Direct Child Call Dependencies' (helper functions invoked by the main logic), explain how the parent and child functions work together. Provide complete, cohesive code examples showing the full working flow so the developer does not have to guess what internal helper functions do.
+4. **Clean Code & 5-Pillar Best Practice Guidance**:
+   - When the user asks for best practices or how to set up/configure code, evaluate and structure your answer against the **Enterprise 5-Pillar Rubric** below:
+     * **Pillar 1 (Resource Management)**: Proper connection pooling, pool size/overflow, pool_recycle, and try/finally lifecycle.
+     * **Pillar 2 (Resilience & Health)**: Dropped socket detection (`pool_pre_ping=True`), explicit network timeouts, and exponential backoff retry.
+     * **Pillar 3 (Security)**: Zero hardcoded secrets (loaded strictly from environment variables/Config), parameterized queries, and SSL enforcement.
+     * **Pillar 4 (Defensive Code)**: Explicit typing, boundary null-guards, low cyclomatic complexity, and typed exception handling.
+     * **Pillar 5 (Observability)**: Structured logging (`logger.info`/`logger.error`), never raw `print()`.
+   - If recommending improvements or refactoring, explain the architectural benefit (e.g. avoiding connection starvation, preventing silent failures, or maintaining single responsibility).
+5. **Code Presentation Rules**:
    - NEVER use markdown pipe tables (| col | col |) for code snippets—they render poorly with multiline code.
    - Always present code in standard fenced code blocks (```language ... ```) for clean syntax highlighting and easy copying.
-   - If suggesting improvements, label them as `// Proposed Code (AI-Generated)` and explain the concrete benefit (e.g., null safety, boundary checks).
-5. **Keep It Punchy & Readable**: Use bolding and clean bullet points. Avoid repeating raw metadata that is already visible in the function cards above.
-"""
+   - If suggesting improvements, label them as `// Proposed Code (AI-Generated)` and explain the concrete benefit.
+6. **Keep It Punchy & Readable**: Use bolding and clean bullet points. Avoid repeating raw metadata that is already visible in the function cards above.
+
+""" + PRODUCTION_BEST_PRACTICES_RUBRIC
 
 KB_MISS_PROMPT_TEMPLATE = """### NOTICE: KNOWLEDGE BASE MISS
 No existing organizational functions in the knowledge base met the similarity threshold for this query.
@@ -134,12 +168,16 @@ No existing organizational functions in the knowledge base met the similarity th
    a. Explicitly inform the developer: "Note: No matching function was found in the organizational knowledge base. The following answer is generated using general programming knowledge."
    b. If the developer provided a code snippet (in the query or attached code) and asked for explanation, review ("is this ok?"), or optimization:
       - **Function Purpose & Workflow**: Clearly explain what the function does and its execution flow.
-      - **Code Review & Quality Check ("Is this OK?")**: Evaluate correctness, potential null/edge cases, readability, and performance bottlenecks.
+      - **Code Review & Quality Check ("Is this OK?")**: Evaluate correctness against the 5-Pillar Rubric (pooling, timeouts, security, null safety, error handling).
       - **Optimized Implementation**: Provide a clean, robust, and refactored code block using appropriate language syntax.
       - **Key Improvements**: Explain what was changed, why it is better, and any best practices applied.
-   c. If generating code from scratch, follow industry best practices, include error handling, type annotations, and explain the implementation.
+   c. If generating code or architecture setup from scratch (e.g., database initialization, APIs, auth, workers):
+      - Strictly adhere to the **Enterprise 5-Pillar Rubric** below.
+      - Never provide naive or toy examples. Always include production-grade connection pooling, health checks (`pool_pre_ping`), environment-driven secrets, typed defensive guards, and structured error handling.
+      - Explain each architectural choice and how it prevents production outages or vulnerabilities.
    d. Remind the developer that they can save this answer to the organization's knowledge base if it solves their need.
-"""
+
+""" + PRODUCTION_BEST_PRACTICES_RUBRIC
 
 CODE_IMPROVEMENT_PROMPT_TEMPLATE = """### CONTEXT: ORIGINAL FUNCTION UNDER REVIEW
 {context_functions}
@@ -152,13 +190,15 @@ CODE_IMPROVEMENT_PROMPT_TEMPLATE = """### CONTEXT: ORIGINAL FUNCTION UNDER REVIE
 {attached_code_section}
 
 ### INSTRUCTIONS:
-Provide a structured code improvement review:
-1. **Analysis of Original Code**: Identify bottlenecks, edge cases, or readability improvements.
-2. **Proposed Modified Function**: Write the complete refactored/improved function with clean documentation.
-3. **Detailed Explanation of Modifications**: What was changed and why.
-4. **Expected Benefits**: Quantify or explain performance, memory, or maintainability gains.
+Provide a structured code improvement review evaluated against the Enterprise 5-Pillar Rubric:
+1. **Analysis of Original Code**: Identify bottlenecks, edge cases, missing error handling, or security/resource leaks.
+2. **Proposed Modified Function**: Write the complete refactored/improved function with clean documentation and complete type hints.
+3. **Detailed Explanation of Modifications**: What was changed and why (e.g., connection pooling, pre-ping validation, parameterization, early returns).
+4. **Expected Benefits**: Quantify or explain performance, resilience, memory, or maintainability gains.
 5. **Breaking Changes & Compatibility Considerations**: Note any API or signature changes.
-"""
+
+""" + PRODUCTION_BEST_PRACTICES_RUBRIC
+
 
 CODE_CONVERSION_PROMPT_TEMPLATE = """### CONTEXT: REFERENCE ORGANIZATIONAL FUNCTIONS
 {context_functions}

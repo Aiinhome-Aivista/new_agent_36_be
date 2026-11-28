@@ -23,7 +23,7 @@ import textwrap
 from pathlib import Path
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Set
 
 # Suppress deprecation warnings from C-extensions / tree_sitter legacy bindings
 warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
@@ -591,6 +591,23 @@ class CodeParserService:
                 tree = parser.parse(code_bytes)
                 lines = code.split("\n")
 
+                # Extract top-level module docstring & file-level imports for parent context
+                module_docstring = ""
+                file_imports: List[str] = []
+
+                if tree.root_node:
+                    for child in tree.root_node.children:
+                        if not module_docstring and child.type == "expression_statement":
+                            for sub in child.children:
+                                if sub.type == "string":
+                                    raw_text = sub.text.decode("utf-8", errors="replace").strip("\"' \n\r\t")
+                                    module_docstring = " ".join([line.strip() for line in raw_text.splitlines() if line.strip()][:5])
+                                    break
+                        elif child.type in ("import_statement", "import_from_statement", "using_directive"):
+                            imp_str = child.text.decode("utf-8", errors="replace").strip()
+                            if imp_str:
+                                file_imports.append(imp_str)
+
                 func_types = (
                     "method_declaration",
                     "local_function_statement",
@@ -634,6 +651,21 @@ class CodeParserService:
                     if node.parent and node.parent.type == "decorated_definition":
                         start_node = node.parent
 
+                    # Parent Class Hierarchy Resolution
+                    class_name = ""
+                    curr = node.parent
+                    while curr:
+                        if curr.type in (
+                            "class_definition", "class_declaration",
+                            "interface_declaration", "class_specifier",
+                            "struct_specifier"
+                        ):
+                            c_name_node = curr.child_by_field_name("name")
+                            if c_name_node:
+                                class_name = c_name_node.text.decode("utf-8", errors="replace").strip()
+                                break
+                        curr = curr.parent
+
                     start_line = start_node.start_point[0] + 1
                     end_line = node.end_point[0] + 1
                     fn_lines = lines[start_line - 1: end_line]
@@ -652,7 +684,10 @@ class CodeParserService:
                         "start_line": start_line,
                         "end_line": end_line,
                         "complexity": complexity,
-                        "language": norm_lang
+                        "language": norm_lang,
+                        "class_name": class_name,
+                        "module_docstring": module_docstring,
+                        "imports": file_imports
                     })
 
             except Exception as ts_err:
@@ -743,6 +778,189 @@ class CodeParserService:
             logger.debug(f"Tree-sitter logger write error: {log_err}")
 
         return results
+
+    # ── Multi-Language Built-ins & Logging Calls to Ignore in Call-Graph ──────
+    IGNORED_CALLS: Set[str] = {
+        # Python built-ins & standard methods
+        "print", "len", "range", "str", "int", "float", "bool", "dict", "list", "set", "tuple",
+        "super", "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr", "delattr",
+        "append", "extend", "insert", "remove", "pop", "clear", "index", "count", "sort", "reverse",
+        "keys", "values", "items", "get", "update", "split", "join", "strip", "lstrip", "rstrip",
+        "replace", "lower", "upper", "startswith", "endswith", "format", "encode", "decode",
+        "sleep", "round", "abs", "sum", "min", "max", "any", "all", "enumerate", "zip", "open",
+        "exit", "quit", "help", "input", "id", "hash", "repr", "next", "iter",
+        "dumps", "loads", "dump", "load", "read", "write", "close", "flush", "seek", "tell",
+
+        # JavaScript / TypeScript standard library & DOM
+        "console", "log", "warn", "error", "info", "debug", "trace", "dir",
+        "parseInt", "parseFloat", "toString", "valueOf", "slice", "splice", "push", "shift", "unshift",
+        "map", "filter", "reduce", "forEach", "find", "findIndex", "some", "every", "includes",
+        "indexOf", "concat", "match", "search", "trim", "toLowerCase", "toUpperCase",
+        "substring", "substr", "charAt", "charCodeAt", "setTimeout", "setInterval", "clearTimeout",
+        "clearInterval", "Promise", "resolve", "reject", "then", "catch", "finally",
+
+        # C# / Java / Go / C++ common methods & loggers
+        "WriteLine", "Write", "ToString", "Equals", "GetHashCode", "GetType", "CompareTo",
+        "IsNullOrEmpty", "IsNullOrWhiteSpace", "Format", "Add", "Remove", "Contains", "Count",
+        "Clear", "Select", "Where", "ToList", "ToArray", "FirstOrDefault", "Any", "All",
+        "Println", "Printf", "Sprintf", "Fatal", "Panic", "make", "new", "close", "panic", "recover",
+
+        # Observability & logging frameworks
+        "debug", "info", "warning", "error", "critical", "exception", "audit", "metric", "counter"
+    }
+
+    @classmethod
+    def extract_invoked_calls(
+        cls,
+        code: str,
+        language: Optional[str] = None
+    ) -> List[str]:
+        """
+        Extracts all function and method identifiers invoked within a code snippet using Tree-sitter.
+        Filters out language built-ins, standard libraries, and logging/observability noise.
+
+        Handles:
+        - Python: `call` nodes (e.g. `_create_engine()`, `self._validate_ssl()`)
+        - JS/TS: `call_expression` nodes (e.g. `formatDate()`, `this.logger.info()`)
+        - C#: `invocation_expression` nodes (e.g. `BuildConnection()`, `client.Send()`)
+        - Java/Go/C++: standard call expressions
+
+        Returns:
+            List of distinct domain function/method names invoked.
+        """
+        if not code or not code.strip():
+            return []
+
+        norm_lang = cls.normalize_language(language)
+        calls: List[str] = []
+        ignored_lower = {c.lower() for c in cls.IGNORED_CALLS}
+
+        if _TREE_SITTER_AVAILABLE and norm_lang in _PARSERS:
+            try:
+                parser = _PARSERS[norm_lang]
+                tree = parser.parse(code.encode("utf-8"))
+                call_types = ("call", "call_expression", "invocation_expression", "method_invocation")
+
+                def collect_calls(node):
+                    if node.type in call_types:
+                        # Extract called identifier/attribute
+                        fn_node = node.child_by_field_name("function") or node.child_by_field_name("name") or (node.children[0] if node.children else None)
+                        if fn_node:
+                            raw_name = fn_node.text.decode("utf-8", errors="replace").strip()
+                            # Strip object prefixes (e.g. self._create_engine -> _create_engine, this.format -> format)
+                            leaf_name = raw_name.split(".")[-1].split("->")[-1].strip()
+                            # Filter out keywords, builtins, short tokens, and logging prefixes
+                            if leaf_name and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', leaf_name):
+                                if leaf_name.lower() not in ignored_lower and leaf_name not in cls.IGNORED_CALLS:
+                                    if not any(raw_name.startswith(p) for p in (
+                                        "logger.", "logging.", "console.", "metrics.", "tracer.", "audit.",
+                                        "json.", "os.", "sys.", "re.", "math.", "time.", "datetime.", "random.", "pathlib.", "io."
+                                    )):
+                                        calls.append(leaf_name)
+
+                    for child in node.children:
+                        collect_calls(child)
+
+                if tree.root_node:
+                    collect_calls(tree.root_node)
+
+            except Exception as e:
+                logger.debug(f"Tree-sitter call extraction notice: {e}")
+
+        # Resilient fallback if Tree-sitter didn't extract or unavailable
+        if not calls:
+            found = re.findall(r'(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(', code)
+            common_ignores = {"if", "for", "while", "switch", "catch", "return"} | ignored_lower
+            calls = [fn for fn in found if fn.lower() not in common_ignores]
+
+        return list(dict.fromkeys(calls))
+
+    @classmethod
+    def generate_skeleton_stub(
+        cls,
+        code: str,
+        language: Optional[str] = None,
+        max_lines: int = 50,
+        source_file: Optional[str] = None
+    ) -> str:
+        """
+        Generates a compact 'Skeleton Stub' (Signature + Parameters + Docstring + Contract)
+        for a helper function when the full body exceeds token budgets or threshold lines.
+
+        Example:
+        def create_connection_pool(db_url: str, pool_size: int = 10) -> ConnectionPool:
+            \"\"\"Initializes and returns a pooled database connection manager.\"\"\"
+            ...  # [Implementation omitted: 280 lines from db/pool.py]
+
+        Args:
+            code: Full function source code.
+            language: Programming language key.
+            max_lines: Maximum lines allowed before stubbing.
+            source_file: Optional source filename to annotate stub origin.
+
+        Returns:
+            str: Full code if <= max_lines, otherwise compact skeleton stub.
+        """
+        if not code or not code.strip():
+            return ""
+
+        raw_lines = code.strip().split("\n")
+        total_lines = len(raw_lines)
+        if total_lines <= max_lines:
+            return code
+
+        norm_lang = cls.normalize_language(language)
+        file_hint = f" from {source_file}" if source_file else ""
+
+        if norm_lang == "python":
+            header_lines = []
+            docstring_lines = []
+            in_header = True
+            in_docstring = False
+            docstring_delim = None
+
+            for line in raw_lines:
+                if in_header:
+                    header_lines.append(line)
+                    if line.rstrip().endswith(":"):
+                        in_header = False
+                    continue
+
+                stripped = line.strip()
+                if not in_docstring:
+                    if stripped.startswith('"""') or stripped.startswith("'''"):
+                        in_docstring = True
+                        docstring_delim = stripped[:3]
+                        docstring_lines.append(line)
+                        if stripped.endswith(docstring_delim) and len(stripped) > 3:
+                            break
+                    elif stripped:
+                        break  # Non-docstring code reached
+                else:
+                    docstring_lines.append(line)
+                    if stripped.endswith(docstring_delim):
+                        break
+
+            stub_header = "\n".join(header_lines)
+            stub_doc = ("\n" + "\n".join(docstring_lines)) if docstring_lines else ""
+            indent = "    "
+            stub_body = f"\n{indent}...  # [Implementation omitted: {total_lines} lines{file_hint}]"
+            return f"{stub_header}{stub_doc}{stub_body}"
+
+        else:
+            # JS, TS, C#, Java, Go, C++
+            header_lines = []
+            for line in raw_lines:
+                header_lines.append(line)
+                if "{" in line:
+                    break
+                if len(header_lines) > 10:
+                    break
+
+            stub_header = "\n".join(header_lines)
+            indent = "    "
+            stub_body = f"\n{indent}// ... [Implementation omitted: {total_lines} lines{file_hint}]\n{indent}return null;\n}}"
+            return f"{stub_header}{stub_body}"
 
 
 # Singleton export for system-wide consumption
